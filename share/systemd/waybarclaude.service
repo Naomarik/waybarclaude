@@ -1,0 +1,21 @@
+# waybarclaude:managed
+[Unit]
+Description=waybarclaude - queue of Claude Code sessions waiting on you
+Documentation=https://github.com/naomarik/waybarclaude
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BIN@ watch
+# The daemon blocks on two event sockets and never polls, so it only needs a
+# restart if the compositor or the roster directory disappears entirely.
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+# Deliberately no ProtectSystem/ProtectHome: connecting to the compositor's unix
+# socket needs write access to it, which a read-only mount of /run would refuse,
+# and the state directory is user-configurable so it cannot be allow-listed here.
+
+[Install]
+WantedBy=graphical-session.target

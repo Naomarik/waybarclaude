@@ -1,0 +1,27 @@
+// waybarclaude:managed
+//
+// Waybar module definition for waybarclaude. Pulled in via waybar's "include",
+// so your own config.jsonc only needs the include line plus the module name in
+// one of your modules-* arrays.
+//
+//   "include": ["~/.config/waybar/claude-queue.jsonc"],
+//   "modules-right": [..., "custom/claude-queue"],
+//
+// @BIN@ is replaced with the installed path of claude-queue, so the module does
+// not depend on waybar inheriting your PATH. If you copy this file by hand,
+// substitute it yourself.
+//
+// Note on waybar include precedence: a key defined in your own config.jsonc wins
+// over the same key here. If you want to change something below, override it in
+// your own config rather than editing this file, which the installer replaces.
+{
+  "custom/claude-queue": {
+    "exec": "@BIN@ status",
+    "return-type": "json",
+    "interval": "once",
+    "signal": 14,
+    "on-click": "@BIN@ menu",
+    "on-click-right": "@BIN@ clear",
+    "tooltip": true
+  }
+}

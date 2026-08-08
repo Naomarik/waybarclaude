@@ -1,0 +1,31 @@
+# waybarclaude:managed  (reference copy; delete this line in your own config)
+# waybarclaude configuration -- copy to ~/.config/waybarclaude/config
+#
+# This file is sourced by bash, so it is shell syntax, and only the keys you set
+# override the defaults. Every value below is shown at its default.
+
+# Window classes (Wayland app-ids) that may host a Claude session. Space
+# separated. Find yours with:  hyprctl clients -j | jq -r '.[].class' | sort -u
+#TERMINAL_CLASSES="com.mitchellh.ghostty Alacritty kitty foot"
+
+# Where Claude Code keeps its state.
+#CLAUDE_DIR="$HOME/.claude"
+
+# Real-time signal used to refresh the waybar module. Must match the "signal"
+# value in claude-queue.jsonc, and must not collide with your other modules.
+# Check what is taken:  grep -o '"signal": *[0-9]*' ~/.config/waybar/config.jsonc
+#WAYBAR_SIGNAL=14
+
+# Bar icons. The defaults are Nerd Font glyphs (timer-sand and bell); plain
+# Unicode like ✳ often has no coverage in bar fonts, so check before changing.
+#ICON_RUNNING='󰔟'
+#ICON_WAITING='󰂚'
+
+# Picker. Leave empty to auto-detect, in this order:
+#   omarchy-launch-walker, walker, fuzzel, rofi, wofi, tofi, bemenu, dmenu
+# Set to one of those names to force it, or to a full command line that reads
+# candidate lines on stdin and prints the chosen one.
+#MENU=''
+#MENU_WIDTH=900
+#MENU_LINES=15
+#MENU_PROMPT='Claude sessions…'

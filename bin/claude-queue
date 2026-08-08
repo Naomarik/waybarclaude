@@ -1,0 +1,919 @@
+#!/usr/bin/env bash
+# waybarclaude:managed
+#
+# claude-queue -- a waybar queue of Claude Code sessions that are waiting on you,
+# plus a live count of the ones still working.
+#
+# HOW IT KNOWS ANYTHING
+# Claude Code maintains a roster at ~/.claude/sessions/<pid>.json and rewrites a
+# session's file on every status transition (busy <-> idle). Watching that
+# directory is enough to know when a turn starts and ends. There are no Claude
+# Code hooks involved: this tool never writes under ~/.claude, never signals a
+# session, and never touches a session's messaging socket. It is pure read-only
+# observation, so it cannot disturb a running session.
+#
+# HOW IT FINDS A SESSION'S WINDOW
+# Terminals like Ghostty run every window in one process, so a session's window
+# cannot be derived from the process tree. Two mechanisms cover it:
+#   1. Claude records the terminal title it set for a session as "aiTitle" in the
+#      session transcript. The live window title is that same string behind a
+#      status marker, so matching the two identifies the window exactly. This
+#      works for sessions that already existed before the daemon started.
+#   2. If a session has no title yet, the window focused at the moment a turn
+#      starts is its window, because you just pressed enter in it.
+# A session lives in one window for its whole life, so the first binding wins.
+#
+# Subcommands:
+#   status            waybar JSON: in-flight count + waiting count
+#   menu              picker; selecting focuses the window and dequeues it
+#   watch             the event daemon (blocks; run under systemd)
+#   enqueue <sid>     add a session to the queue
+#   drop <sid>        remove by session id      (exit 1 if it was not queued)
+#   drop-addr <addr>  remove by window address  (exit 1 if it was not queued)
+#   bind <sid> <addr> record which window a session lives in (first bind wins)
+#   resolve <sid>     find a session's window by matching its transcript title
+#   unbind <sid>      forget a session's window so it can be re-learned
+#   list              print the queue and the bindings, for debugging
+#   clear             empty the queue
+#   sync              prune dead sessions and closed windows, rewrite caches
+#   signal            nudge waybar
+#   doctor            check dependencies and report what is wired up
+
+set -uo pipefail
+
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+
+# --- defaults ----------------------------------------------------------------
+# Window classes (app-ids) that may host a Claude session. Space separated.
+TERMINAL_CLASSES="com.mitchellh.ghostty Alacritty alacritty kitty foot footclient
+org.wezfurlong.wezterm com.raggesilver.BlackBox org.gnome.Console org.gnome.Terminal
+dev.warp.Warp io.elementary.terminal Termite konsole xterm URxvt"
+
+CLAUDE_DIR="$HOME/.claude"
+WAYBAR_SIGNAL=14
+ICON_RUNNING='󰔟' # nf-md-timer_sand
+ICON_WAITING='󰂚' # nf-md-bell
+MENU=''          # empty = auto-detect; a known name, or a full command line
+MENU_WIDTH=900
+MENU_LINES=15
+MENU_PROMPT='Claude sessions…'
+
+CONFIG="${WBC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/waybarclaude/config}"
+# shellcheck source=/dev/null
+[[ -r $CONFIG ]] && . "$CONFIG"
+
+# Env wins over the config file, so tests can point at a scratch roster without
+# going anywhere near the real one.
+SESSIONS_DIR="${WBC_SESSIONS_DIR:-$CLAUDE_DIR/sessions}"
+PROJECTS_DIR="${WBC_PROJECTS_DIR:-$CLAUDE_DIR/projects}"
+STATE="${WBC_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-queue}"
+MENU="${WBC_MENU:-$MENU}"
+
+QUEUE="$STATE/queue.tsv"
+ADDRS="$STATE/addrs" # one line of queued window addresses; the daemon's hot path
+BINDINGS="$STATE/bindings.tsv"
+LOCK="$STATE/lock"
+
+# Records are separated by 0x1f rather than tab. A tab in IFS counts as IFS
+# whitespace, so bash collapses runs of it and every field after an empty one
+# shifts left.
+SEP=$'\x1f'
+
+# Set WBC_DEBUG to a file path to trace daemon decisions.
+DEBUG=${WBC_DEBUG:-}
+dbg() {
+  [[ -n $DEBUG ]] && printf '%s\n' "$*" >>"$DEBUG"
+  return 0
+}
+
+mkdir -p "$STATE"
+[[ -f $QUEUE ]] || : >"$QUEUE"
+[[ -f $BINDINGS ]] || : >"$BINDINGS"
+[[ -f $ADDRS ]] || : >"$ADDRS"
+
+declare -A TERM_CLASS_SET=()
+_c=''
+for _c in $TERMINAL_CLASSES; do TERM_CLASS_SET[$_c]=1; done
+unset _c
+
+# --- compositor --------------------------------------------------------------
+# Hyprland only for now. Everything compositor-specific is in this section:
+# a port to Sway would reimplement these four functions against swaymsg.
+hypr_ready() {
+  [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && return 0
+  # Under systemd the variable may be absent even though Hyprland is running,
+  # so fall back to the newest instance directory in the runtime dir.
+  local d newest=''
+  for d in "${XDG_RUNTIME_DIR:-/run/user/$UID}"/hypr/*/; do
+    [[ -S "${d}.socket2.sock" ]] || continue
+    [[ -z $newest || $d -nt $newest ]] && newest=$d
+  done
+  [[ -n $newest ]] || return 1
+  newest=${newest%/}
+  export HYPRLAND_INSTANCE_SIGNATURE=${newest##*/}
+}
+
+event_socket() {
+  hypr_ready || return 1
+  printf '%s/hypr/%s/.socket2.sock' \
+    "${XDG_RUNTIME_DIR:-/run/user/$UID}" "$HYPRLAND_INSTANCE_SIGNATURE"
+}
+
+# address SEP class SEP title, one line per window
+enumerate_windows() {
+  hypr_ready || return 1
+  hyprctl clients -j 2>/dev/null |
+    jq -r --arg s "$SEP" '.[] | .address + $s + .class + $s + .title' 2>/dev/null
+}
+
+focused_window() {
+  hypr_ready || return 1
+  hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty' 2>/dev/null
+}
+
+focus_window() {
+  hypr_ready || return 1
+  hyprctl dispatch focuswindow "address:$1" >/dev/null 2>&1
+}
+
+# --- roster ------------------------------------------------------------------
+# A session is in flight while its status is busy or thinking. Anything else
+# (idle, waiting, blocked) means the turn is over and it wants your attention.
+declare -A R_STATUS R_NAME R_CWD
+ROSTER_IDS=()
+
+in_flight() { [[ $1 == busy || $1 == thinking ]]; }
+
+scan_roster() {
+  local f j sid
+  ROSTER_IDS=()
+  R_STATUS=()
+  R_NAME=()
+  R_CWD=()
+  for f in "$SESSIONS_DIR"/*.json; do
+    [[ -e $f ]] || continue
+    j=''
+    IFS= read -r -d '' j <"$f" 2>/dev/null || :
+    [[ -n $j ]] || continue
+    [[ $j =~ \"sessionId\":\"([^\"]+)\" ]] || continue
+    sid=${BASH_REMATCH[1]}
+    R_STATUS[$sid]=idle
+    [[ $j =~ \"status\":\"([^\"]+)\" ]] && R_STATUS[$sid]=${BASH_REMATCH[1]}
+    R_NAME[$sid]=$sid
+    [[ $j =~ \"name\":\"([^\"]*)\" ]] && R_NAME[$sid]=${BASH_REMATCH[1]}
+    R_CWD[$sid]=''
+    [[ $j =~ \"cwd\":\"([^\"]*)\" ]] && R_CWD[$sid]=${BASH_REMATCH[1]}
+    ROSTER_IDS+=("$sid")
+  done
+}
+
+session_alive() {
+  local sid=$1 f j
+  for f in "$SESSIONS_DIR"/*.json; do
+    [[ -e $f ]] || continue
+    j=''
+    IFS= read -r -d '' j <"$f" 2>/dev/null || :
+    [[ $j == *"\"sessionId\":\"$sid\""* ]] && return 0
+  done
+  return 1
+}
+
+# --- windows -----------------------------------------------------------------
+declare -A W_TITLE W_TERM
+have_windows=0
+
+load_windows() {
+  local a c t
+  ((have_windows)) && return 0
+  have_windows=1
+  while IFS=$SEP read -r a c t; do
+    [[ -n $a ]] || continue
+    W_TITLE[$a]=$t
+    [[ -n ${TERM_CLASS_SET[$c]:-} ]] && W_TERM[$a]=1
+  done < <(enumerate_windows)
+}
+
+reset_windows() {
+  have_windows=0
+  W_TITLE=()
+  W_TERM=()
+}
+
+is_terminal() {
+  load_windows
+  [[ -n ${W_TERM[$1]:-} ]]
+}
+
+# --- matching a session to its window ----------------------------------------
+ai_title() {
+  local sid=$1 cands f line
+  cands=("$PROJECTS_DIR"/*/"$sid.jsonl")
+  f=${cands[0]}
+  [[ -f $f ]] || return 1
+  # No `|| return 1` on this pipeline: grep -m1 exits early, tac then dies of
+  # SIGPIPE, and pipefail would report that as a failure. The emptiness test
+  # below is the real check.
+  line=$(tac -- "$f" 2>/dev/null | grep -m1 -o '"aiTitle":"[^"]*"')
+  [[ -n $line ]] || return 1
+  line=${line#'"aiTitle":"'}
+  printf '%s' "${line%\"}"
+}
+
+# Exactly one terminal window whose title is, or ends with, this text. Ambiguity
+# means we decline rather than guess.
+window_for_title() {
+  local want=$1 a hit='' n=0
+  load_windows
+  for a in "${!W_TERM[@]}"; do
+    if [[ ${W_TITLE[$a]} == "$want" || ${W_TITLE[$a]} == *" $want" ]]; then
+      hit=$a
+      ((n++))
+    fi
+  done
+  ((n == 1)) || return 1
+  printf '%s' "$hit"
+}
+
+# --- bindings ----------------------------------------------------------------
+binding_for() {
+  local sid=$1 s a
+  while IFS=$SEP read -r s a; do
+    [[ $s == "$sid" ]] && {
+      printf '%s' "$a"
+      return 0
+    }
+  done <"$BINDINGS"
+  return 1
+}
+
+owner_of_addr() {
+  local addr=$1 s a
+  while IFS=$SEP read -r s a; do
+    [[ $a == "$addr" ]] && {
+      printf '%s' "$s"
+      return 0
+    }
+  done <"$BINDINGS"
+  return 1
+}
+
+bind_persist() {
+  local sid=$1 addr=$2 keep=() s a
+  exec 8>"$LOCK"
+  flock 8
+  while IFS=$SEP read -r s a; do
+    [[ -n $s ]] || continue
+    [[ $s == "$sid" || $a == "$addr" ]] && continue
+    keep+=("$s$SEP$a")
+  done <"$BINDINGS"
+  keep+=("$sid$SEP$addr")
+  printf '%s\n' "${keep[@]}" >"$BINDINGS.tmp" && mv -f "$BINDINGS.tmp" "$BINDINGS"
+  flock -u 8
+  exec 8>&-
+}
+
+# Bind by transcript title. Prints the address it settled on.
+resolve_one() {
+  local sid=$1 t addr owner
+  t=$(ai_title "$sid") || return 1
+  [[ -n $t ]] || return 1
+  addr=$(window_for_title "$t") || return 1
+  owner=$(owner_of_addr "$addr") || owner=''
+  if [[ -n $owner && $owner != "$sid" ]] && session_alive "$owner"; then
+    return 1
+  fi
+  bind_persist "$sid" "$addr"
+  printf '%s' "$addr"
+}
+
+resolve_all() {
+  local sid
+  for sid in "${ROSTER_IDS[@]:-}"; do
+    [[ -n $sid ]] || continue
+    binding_for "$sid" >/dev/null && continue
+    resolve_one "$sid" >/dev/null || :
+  done
+}
+
+# Bind from the focused window, used when a turn starts. Weaker evidence than
+# the title match, so it only fills gaps the transcript could not.
+cmd_bind() {
+  local sid=$1 addr=$2 cur owner
+  [[ -n $addr && $addr != 0x0 ]] || return 1
+  cur=$(binding_for "$sid") || cur=''
+  [[ $cur == "$addr" ]] && return 0
+  if [[ -n $cur ]]; then
+    load_windows
+    [[ -n ${W_TITLE[$cur]:-} ]] && return 0 # existing binding still valid
+  fi
+  owner=$(owner_of_addr "$addr") || owner=''
+  if [[ -n $owner && $owner != "$sid" ]] && session_alive "$owner"; then
+    return 1 # another live session already claims this window
+  fi
+  is_terminal "$addr" || return 1
+  bind_persist "$sid" "$addr"
+}
+
+cmd_unbind() {
+  local sid=$1 keep=() s a
+  while IFS=$SEP read -r s a; do
+    [[ -n $s && $s != "$sid" ]] && keep+=("$s$SEP$a")
+  done <"$BINDINGS"
+  if ((${#keep[@]})); then printf '%s\n' "${keep[@]}" >"$BINDINGS"; else : >"$BINDINGS"; fi
+}
+
+# --- queue -------------------------------------------------------------------
+# queue.tsv record: sid SEP addr SEP name SEP cwd SEP epoch SEP title
+write_addrs() {
+  local addrs='' sid addr rest
+  while IFS=$SEP read -r sid addr rest; do
+    [[ -n $addr ]] && addrs+="$addr "
+  done <"$QUEUE"
+  printf '%s\n' "${addrs% }" >"$ADDRS"
+}
+
+signal_waybar() { pkill -RTMIN+"$WAYBAR_SIGNAL" waybar 2>/dev/null || :; }
+
+sanitize() {
+  local v=$1
+  v=${v//$SEP/ }
+  v=${v//$'\n'/ }
+  printf '%s' "$v"
+}
+
+cmd_enqueue() {
+  local sid=$1 addr name cwd title='' keep=() s rest
+  scan_roster
+  [[ -n ${R_STATUS[$sid]:-} ]] || return 1
+  name=${R_NAME[$sid]}
+  cwd=${R_CWD[$sid]}
+  addr=$(binding_for "$sid") || addr=''
+  [[ -n $addr ]] || addr=$(resolve_one "$sid") || addr=''
+  if [[ -n $addr ]]; then
+    load_windows
+    title=${W_TITLE[$addr]:-}
+  fi
+  [[ -n $title ]] || title=$name
+
+  exec 8>"$LOCK"
+  flock 8
+  while IFS=$SEP read -r s rest; do
+    [[ -n $s && $s != "$sid" ]] && keep+=("$s$SEP$rest")
+  done <"$QUEUE"
+  keep+=("$sid$SEP$addr$SEP$(sanitize "$name")$SEP$(sanitize "$cwd")$SEP$EPOCHSECONDS$SEP$(sanitize "$title")")
+  printf '%s\n' "${keep[@]}" >"$QUEUE.tmp" && mv -f "$QUEUE.tmp" "$QUEUE"
+  flock -u 8
+  exec 8>&-
+
+  write_addrs
+  signal_waybar
+}
+
+# Remove queue records whose field $1 (1=sid, 2=addr) equals $2. Returns 1 when
+# nothing matched, so callers can tell a real change from a no-op.
+queue_remove() {
+  local field=$1 value=$2 removed=0 keep=() sid addr name cwd ts title cmp
+  exec 8>"$LOCK"
+  flock 8
+  while IFS=$SEP read -r sid addr name cwd ts title; do
+    [[ -n $sid ]] || continue
+    if ((field == 1)); then cmp=$sid; else cmp=$addr; fi
+    if [[ $cmp == "$value" ]]; then
+      removed=1
+      continue
+    fi
+    keep+=("$sid$SEP$addr$SEP$name$SEP$cwd$SEP$ts$SEP$title")
+  done <"$QUEUE"
+  if ((removed)); then
+    if ((${#keep[@]})); then
+      printf '%s\n' "${keep[@]}" >"$QUEUE.tmp"
+    else
+      : >"$QUEUE.tmp"
+    fi
+    mv -f "$QUEUE.tmp" "$QUEUE"
+  fi
+  flock -u 8
+  exec 8>&-
+
+  ((removed)) || return 1
+  write_addrs
+  signal_waybar
+  return 0
+}
+
+cmd_drop() { queue_remove 1 "$1"; }
+cmd_drop_addr() { queue_remove 2 "$1"; }
+
+cmd_clear() {
+  [[ -s $QUEUE ]] || return 1
+  : >"$QUEUE"
+  write_addrs
+  signal_waybar
+}
+
+cmd_sync() {
+  local sid addr name cwd ts title s a old='' new='' i
+  local -a keep=() b_keep=()
+  scan_roster
+  load_windows
+
+  # Bindings: forget sessions that ended and windows that closed.
+  while IFS=$SEP read -r s a; do
+    [[ -n $s ]] || continue
+    [[ -z ${R_STATUS[$s]:-} || -z ${W_TITLE[$a]:-} ]] && continue
+    b_keep+=("$s$SEP$a")
+  done <"$BINDINGS"
+  if ((${#b_keep[@]})); then
+    printf '%s\n' "${b_keep[@]}" >"$BINDINGS.tmp"
+  else
+    : >"$BINDINGS.tmp"
+  fi
+  mv -f "$BINDINGS.tmp" "$BINDINGS"
+
+  # Then learn whatever the transcripts can tell us about the rest.
+  resolve_all
+
+  # Queue: drop sessions that ended or went back to work, refresh the rest.
+  while IFS=$SEP read -r sid addr name cwd ts title; do
+    [[ -n $sid ]] || continue
+    [[ -z ${R_STATUS[$sid]:-} ]] && continue
+    in_flight "${R_STATUS[$sid]}" && continue
+    addr=$(binding_for "$sid") || addr=''
+    [[ -n $addr && -n ${W_TITLE[$addr]:-} ]] && title=${W_TITLE[$addr]}
+    keep+=("$sid$SEP$addr$SEP$name$SEP$cwd$SEP$ts$SEP$title")
+  done <"$QUEUE"
+
+  for ((i = 0; i < ${#keep[@]}; i++)); do new+="${keep[i]}"$'\n'; done
+  IFS= read -r -d '' old <"$QUEUE" 2>/dev/null || :
+  if [[ $old != "$new" ]]; then
+    printf '%s' "$new" >"$QUEUE.tmp"
+    mv -f "$QUEUE.tmp" "$QUEUE"
+    write_addrs
+    signal_waybar
+  else
+    write_addrs
+  fi
+  return 0
+}
+
+# --- waybar ------------------------------------------------------------------
+esc() {
+  local v=$1
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf '%s' "$v"
+}
+
+tilde() {
+  local v=$1
+  printf '%s' "${v/#"$HOME"/\~}"
+}
+
+cmd_status() {
+  local sid addr t name cwd ts title running=0 waiting=0 text='' class='' tip='' l
+  local -a flight=() wait_lines=()
+
+  scan_roster
+  while IFS=$SEP read -r sid addr name cwd ts title; do
+    [[ -n $sid ]] || continue
+    # A session that is running again is not waiting on you, even if sync has
+    # not pruned the record yet.
+    [[ -n ${R_STATUS[$sid]:-} ]] && in_flight "${R_STATUS[$sid]}" && continue
+    ((waiting++))
+    t=''
+    if [[ -n $addr ]]; then
+      load_windows
+      t=${W_TITLE[$addr]:-}
+    fi
+    [[ -n $t ]] || t=$title
+    wait_lines+=("$t  ·  $(tilde "$cwd")")
+  done <"$QUEUE"
+
+  for sid in "${ROSTER_IDS[@]:-}"; do
+    [[ -n $sid ]] || continue
+    in_flight "${R_STATUS[$sid]}" || continue
+    ((running++))
+    addr=$(binding_for "$sid") || addr=''
+    t=''
+    if [[ -n $addr ]]; then
+      load_windows
+      t=${W_TITLE[$addr]:-}
+    fi
+    [[ -n $t ]] || t=${R_NAME[$sid]}
+    flight+=("$t  ·  $(tilde "${R_CWD[$sid]}")")
+  done
+
+  if ((running == 0 && waiting == 0)); then
+    printf '{"text":"","tooltip":"","class":"empty"}\n'
+    return 0
+  fi
+
+  ((running)) && text="$ICON_RUNNING $running"
+  if ((waiting)); then
+    [[ -n $text ]] && text+="  "
+    text+="$ICON_WAITING $waiting"
+  fi
+  if ((running && waiting)); then
+    class=both
+  elif ((waiting)); then
+    class=waiting
+  else
+    class=running
+  fi
+
+  if ((waiting)); then
+    tip+="$ICON_WAITING $waiting waiting on you"
+    for l in "${wait_lines[@]}"; do tip+="\n   $(esc "$l")"; done
+  fi
+  if ((running)); then
+    [[ -n $tip ]] && tip+="\n"
+    tip+="$ICON_RUNNING $running in flight"
+    for l in "${flight[@]}"; do tip+="\n   $(esc "$l")"; done
+  fi
+  tip+="\n\nClick to jump to a session · Right-click clears the queue"
+
+  printf '{"text":"%s","tooltip":"%s","class":"%s"}\n' "$(esc "$text")" "$tip" "$class"
+}
+
+# --- picker ------------------------------------------------------------------
+detect_menu() {
+  local m
+  if [[ -n $MENU ]]; then
+    printf '%s' "$MENU"
+    return 0
+  fi
+  # Prefer omarchy's launcher when present: it also makes sure walker's data
+  # provider is running.
+  command -v omarchy-launch-walker >/dev/null 2>&1 && {
+    printf 'omarchy-walker'
+    return 0
+  }
+  for m in walker fuzzel rofi wofi tofi bemenu dmenu; do
+    command -v "$m" >/dev/null 2>&1 && {
+      printf '%s' "$m"
+      return 0
+    }
+  done
+  return 1
+}
+
+# Reads candidate lines on stdin, prints the chosen line.
+run_menu() {
+  local m
+  m=$(detect_menu) || return 1
+  case $m in
+  omarchy-walker)
+    omarchy-launch-walker --dmenu --width "$MENU_WIDTH" --minheight 1 \
+      --maxheight 630 -p "$MENU_PROMPT"
+    ;;
+  walker)
+    walker --dmenu --width "$MENU_WIDTH" --minheight 1 --maxheight 630 \
+      -p "$MENU_PROMPT"
+    ;;
+  fuzzel) fuzzel --dmenu --prompt "$MENU_PROMPT " ;;
+  rofi) rofi -dmenu -i -p "$MENU_PROMPT" ;;
+  wofi) wofi --dmenu --prompt "$MENU_PROMPT" ;;
+  tofi) tofi --prompt-text "$MENU_PROMPT " ;;
+  bemenu) bemenu -l "$MENU_LINES" -p "$MENU_PROMPT" ;;
+  dmenu) dmenu -l "$MENU_LINES" -p "$MENU_PROMPT" ;;
+  *) eval "$m" ;; # a full command line from the config file
+  esac
+}
+
+cmd_menu() {
+  local -a lines=()
+  local -A PICK=()
+  local sid addr name cwd ts title label t kind entry sel
+
+  cmd_sync
+  load_windows
+
+  while IFS=$SEP read -r sid addr name cwd ts title; do
+    [[ -n $sid ]] || continue
+    t=''
+    [[ -n $addr ]] && t=${W_TITLE[$addr]:-}
+    [[ -n $t ]] || t=$title
+    label="$ICON_WAITING  $t   ·  $(tilde "$cwd")"
+    while [[ -n ${PICK[$label]:-} ]]; do label+=' '; done
+    PICK[$label]="q$SEP$sid$SEP$addr"
+    lines+=("$label")
+  done <"$QUEUE"
+
+  for sid in "${ROSTER_IDS[@]:-}"; do
+    [[ -n $sid ]] || continue
+    in_flight "${R_STATUS[$sid]}" || continue
+    addr=$(binding_for "$sid") || addr=''
+    t=''
+    [[ -n $addr ]] && t=${W_TITLE[$addr]:-}
+    [[ -n $t ]] || t=${R_NAME[$sid]}
+    label="$ICON_RUNNING  $t   ·  $(tilde "${R_CWD[$sid]}")"
+    while [[ -n ${PICK[$label]:-} ]]; do label+=' '; done
+    PICK[$label]="r$SEP$sid$SEP$addr"
+    lines+=("$label")
+  done
+
+  if ((${#lines[@]} == 0)); then
+    notify-send -u low "Claude queue" "Nothing waiting, nothing running." 2>/dev/null || :
+    return 0
+  fi
+
+  sel=$(printf '%s\n' "${lines[@]}" | run_menu 2>/dev/null) || return 0
+  [[ -n $sel ]] || return 0
+
+  entry=${PICK[$sel]:-}
+  [[ -n $entry ]] || return 0
+  IFS=$SEP read -r kind sid addr <<<"$entry"
+
+  [[ -n $addr ]] && focus_window "$addr"
+  [[ $kind == q ]] && cmd_drop "$sid"
+  return 0
+}
+
+# --- daemon ------------------------------------------------------------------
+# Four processes, all blocked on a read: this shell, a supervisor subshell,
+# socat on the compositor event socket, and inotifywait on the roster directory.
+# Nothing polls and there is no timer, so idle CPU is zero. Compositor events
+# other than focus and window-close are discarded by a shell pattern match with
+# no fork. A subprocess is forked only when something real happens: a turn
+# starts, a turn ends, or a queued window gets focused.
+declare -A PREV SID
+CUR_FOCUS=''
+
+# True when this window address currently has a queue entry. A builtin read of a
+# one-line file, so the hot path costs no fork.
+queued_addr() {
+  local addrs=''
+  read -r addrs <"$ADDRS" 2>/dev/null
+  [[ -n $addrs && " $addrs " == *" $1 "* ]]
+}
+
+daemon_resync() {
+  local f j sid st
+  CUR_FOCUS=$(focused_window) || CUR_FOCUS=''
+  PREV=()
+  SID=()
+  for f in "$SESSIONS_DIR"/*.json; do
+    [[ -e $f ]] || continue
+    j=''
+    IFS= read -r -d '' j <"$f" 2>/dev/null || :
+    [[ $j =~ \"sessionId\":\"([^\"]+)\" ]] || continue
+    sid=${BASH_REMATCH[1]}
+    st=idle
+    [[ $j =~ \"status\":\"([^\"]+)\" ]] && st=${BASH_REMATCH[1]}
+    PREV[${f##*/}]=$st
+    SID[${f##*/}]=$sid
+  done
+  "$SELF" sync >/dev/null 2>&1
+}
+
+session_event() {
+  local ev=${1%% *} fn=${1#* } f j sid st prev addr
+  [[ $fn == *.json ]] || return 0
+
+  if [[ $ev == *DELETE* ]]; then
+    sid=${SID[$fn]:-}
+    unset "PREV[$fn]" "SID[$fn]"
+    if [[ -n $sid ]]; then
+      "$SELF" drop "$sid" >/dev/null 2>&1 || "$SELF" signal
+    else
+      "$SELF" signal
+    fi
+    return 0
+  fi
+
+  f="$SESSIONS_DIR/$fn"
+  j=''
+  IFS= read -r -d '' j <"$f" 2>/dev/null || :
+  [[ -n $j ]] || return 0
+  [[ $j =~ \"sessionId\":\"([^\"]+)\" ]] || return 0
+  sid=${BASH_REMATCH[1]}
+  st=idle
+  [[ $j =~ \"status\":\"([^\"]+)\" ]] && st=${BASH_REMATCH[1]}
+
+  prev=${PREV[$fn]:-}
+  PREV[$fn]=$st
+  SID[$fn]=$sid
+  [[ $st == "$prev" ]] && return 0
+  dbg "transition $fn $prev->$st focus=$CUR_FOCUS bound=$(binding_for "$sid" || echo none)"
+
+  if in_flight "$st"; then
+    # A turn started, so you pressed enter in the focused window a moment ago.
+    [[ -n $CUR_FOCUS ]] && "$SELF" bind "$sid" "$CUR_FOCUS" >/dev/null 2>&1
+    # It is working again, so it is no longer waiting on you.
+    "$SELF" drop "$sid" >/dev/null 2>&1 || "$SELF" signal
+  elif in_flight "$prev"; then
+    # A turn ended. If you were looking at it, you already know.
+    addr=$(binding_for "$sid") || addr=''
+    # Not bound yet (a session older than this daemon): the transcript title can
+    # still identify the window, so this check works the first time too.
+    [[ -n $addr ]] || addr=$("$SELF" resolve "$sid" 2>/dev/null)
+    if [[ -n $addr && $addr == "$CUR_FOCUS" ]]; then
+      "$SELF" signal
+    else
+      "$SELF" enqueue "$sid" >/dev/null 2>&1 || "$SELF" signal
+    fi
+  else
+    "$SELF" signal
+  fi
+}
+
+cmd_watch() {
+  local fifo="$STATE/events" sock line a
+
+  sock=$(event_socket) || {
+    echo "claude-queue: no Hyprland instance found" >&2
+    exit 1
+  }
+  for _dep in socat inotifywait jq hyprctl; do
+    command -v "$_dep" >/dev/null 2>&1 || {
+      echo "claude-queue: missing dependency: $_dep" >&2
+      exit 1
+    }
+  done
+
+  # One instance only.
+  exec 9>"$STATE/daemon.lock"
+  flock -n 9 || exit 0
+  echo $$ >"$STATE/daemon.pid"
+
+  mkdir -p "$SESSIONS_DIR"
+
+  # Hold both ends of the FIFO so the read loop never sees EOF when a feeder
+  # dies, and so two writers can share it.
+  rm -f "$fifo"
+  mkfifo -m 600 "$fifo"
+  exec 3<>"$fifo"
+
+  supervise() {
+    local sp='' ip='' backoff=2
+    trap 'kill $sp $ip 2>/dev/null; exit 0' TERM INT
+    while :; do
+      socat -U - UNIX-CONNECT:"$sock" >&3 2>/dev/null &
+      sp=$!
+      inotifywait -m -q --format '%e %f' \
+        -e close_write,create,delete,moved_to "$SESSIONS_DIR" >&3 2>/dev/null &
+      ip=$!
+      backoff=2
+      wait -n 2>/dev/null
+      kill "$sp" "$ip" 2>/dev/null
+      wait 2>/dev/null
+      # A feeder died, e.g. the compositor restarted. Back off, then resync so we
+      # never act on a stale picture, and bring both feeders back together.
+      sleep "$backoff"
+      ((backoff < 60)) && backoff=$((backoff * 2))
+      printf '!resync\n' >&3
+    done
+  }
+
+  daemon_resync
+  supervise &
+  SUP=$!
+  # These handlers must exit explicitly. A trap that only cleaned up would let
+  # bash resume the blocking read below, so the daemon would ignore SIGTERM and
+  # anything trying to stop it would hang.
+  cleanup() { kill "$SUP" 2>/dev/null; }
+  trap cleanup EXIT
+  trap 'cleanup; exit 0' INT TERM HUP
+
+  while IFS= read -r line <&3; do
+    case $line in
+    'activewindowv2>>'*)
+      a=${line#*'>>'}
+      if [[ $a =~ ^[0-9a-fA-F]+$ ]]; then CUR_FOCUS="0x$a"; else CUR_FOCUS=''; fi
+      dbg "focus -> $CUR_FOCUS"
+      # Visiting a session yourself clears its entry.
+      [[ -n $CUR_FOCUS ]] && queued_addr "$CUR_FOCUS" &&
+        "$SELF" drop-addr "$CUR_FOCUS" >/dev/null 2>&1
+      ;;
+    'closewindow>>'*)
+      a=${line#*'>>'}
+      [[ $a =~ ^[0-9a-fA-F]+$ ]] || continue
+      queued_addr "0x$a" && "$SELF" drop-addr "0x$a" >/dev/null 2>&1
+      ;;
+    '!resync')
+      daemon_resync
+      ;;
+    *'>>'*)
+      : # any other compositor event: dropped here, no fork
+      ;;
+    *)
+      session_event "$line"
+      ;;
+    esac
+  done
+}
+
+# --- diagnostics -------------------------------------------------------------
+cmd_list() {
+  local sid addr name cwd ts title s a
+  printf 'queue:\n'
+  while IFS=$SEP read -r sid addr name cwd ts title; do
+    [[ -n $sid ]] || continue
+    printf '  %-14s %-16s %s\n' "$name" "${addr:-unbound}" "$title"
+  done <"$QUEUE"
+  printf 'bindings:\n'
+  while IFS=$SEP read -r s a; do
+    [[ -n $s ]] || continue
+    load_windows
+    printf '  %s  %-16s %s\n' "${s:0:8}" "$a" "${W_TITLE[$a]:-<window gone>}"
+  done <"$BINDINGS"
+}
+
+cmd_doctor() {
+  local ok=0 miss=0 d m p
+  printf 'dependencies\n'
+  for d in bash jq socat inotifywait hyprctl pkill flock tac; do
+    if command -v "$d" >/dev/null 2>&1; then
+      printf '  ok      %s\n' "$d"
+      ((ok++))
+    else
+      printf '  MISSING %s\n' "$d"
+      ((miss++))
+    fi
+  done
+  printf '  %s bash %s\n' \
+    "$([[ ${BASH_VERSINFO[0]} -ge 5 ]] && echo ok || echo MISSING)" "$BASH_VERSION"
+
+  printf 'menu\n'
+  if m=$(detect_menu); then printf '  ok      %s\n' "$m"; else
+    printf '  MISSING no dmenu-capable launcher found\n'
+    ((miss++))
+  fi
+
+  printf 'compositor\n'
+  if hypr_ready; then
+    printf '  ok      Hyprland %s\n' "$HYPRLAND_INSTANCE_SIGNATURE"
+  else
+    printf '  MISSING no Hyprland instance\n'
+    ((miss++))
+  fi
+
+  printf 'claude code\n'
+  if [[ -d $SESSIONS_DIR ]]; then
+    printf '  ok      roster %s (%s live)\n' "$SESSIONS_DIR" \
+      "$(set -- "$SESSIONS_DIR"/*.json; [[ -e $1 ]] && echo $# || echo 0)"
+  else
+    printf '  MISSING %s does not exist\n' "$SESSIONS_DIR"
+    ((miss++))
+  fi
+
+  printf 'daemon\n'
+  p=$(cat "$STATE/daemon.pid" 2>/dev/null) || p=''
+  if [[ -n $p ]] && kill -0 "$p" 2>/dev/null; then
+    printf '  ok      running, pid %s\n' "$p"
+  else
+    printf '  STOPPED start it with: systemctl --user start waybarclaude\n'
+  fi
+
+  printf 'waybar wiring\n'
+  local wcfg="${XDG_CONFIG_HOME:-$HOME/.config}/waybar/config.jsonc"
+  [[ -f $wcfg ]] || wcfg="${XDG_CONFIG_HOME:-$HOME/.config}/waybar/config"
+  if [[ -f $wcfg ]]; then
+    grep -q 'custom/claude-queue' "$wcfg" &&
+      printf '  ok      module listed in %s\n' "${wcfg/#"$HOME"/\~}" ||
+      printf '  TODO    add "custom/claude-queue" to a modules-* array in %s\n' "${wcfg/#"$HOME"/\~}"
+    grep -q 'claude-queue.jsonc' "$wcfg" &&
+      printf '  ok      include present\n' ||
+      printf '  TODO    add claude-queue.jsonc to "include" in %s\n' "${wcfg/#"$HOME"/\~}"
+  else
+    printf '  TODO    no waybar config found\n'
+  fi
+  local scss="${XDG_CONFIG_HOME:-$HOME/.config}/waybar/style.css"
+  if [[ -f $scss ]]; then
+    grep -q 'claude-queue.css' "$scss" &&
+      printf '  ok      style imported\n' ||
+      printf '  TODO    add @import "claude-queue.css"; to style.css\n'
+  fi
+
+  ((miss == 0))
+}
+
+# --- dispatch ----------------------------------------------------------------
+# Resolve the compositor instance once, in this shell, so every later subshell
+# inherits it instead of re-globbing the runtime dir.
+hypr_ready 2>/dev/null || :
+
+case ${1:-status} in
+status) cmd_status ;;
+menu) cmd_menu ;;
+watch) cmd_watch ;;
+enqueue) cmd_enqueue "${2:?session id}" ;;
+drop) cmd_drop "${2:?session id}" ;;
+drop-addr) cmd_drop_addr "${2:?window address}" ;;
+bind) cmd_bind "${2:?session id}" "${3:?window address}" ;;
+resolve) resolve_one "${2:?session id}" ;;
+unbind) cmd_unbind "${2:?session id}" ;;
+list) cmd_list ;;
+clear) cmd_clear ;;
+sync) cmd_sync ;;
+signal) signal_waybar ;;
+doctor) cmd_doctor ;;
+-h | --help | help)
+  sed -n '3,40p' "$SELF" | sed 's/^# \{0,1\}//'
+  ;;
+*)
+  printf 'claude-queue: unknown command %q\n' "$1" >&2
+  printf 'try: claude-queue --help\n' >&2
+  exit 2
+  ;;
+esac
