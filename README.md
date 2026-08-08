@@ -99,8 +99,8 @@ if you copy them by hand.
 
 Walker's default look leans transparent with large rows, which gets hard to read
 over a busy screen. There is a small theme for **the picker only** — opaque panel,
-compact monospace rows, a hairline under the prompt, and an amber accent bar on the
-rows waiting on you:
+compact monospace rows, and a hairline under the prompt, with the rows still
+working dimmed back:
 
 ```sh
 ./walker-theme/install.sh

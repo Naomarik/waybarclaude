@@ -13,8 +13,8 @@ itself, because it is the one piece that has to edit a config file you own.
 
 Opaque panel instead of transparent, so rows stay readable over a busy screen.
 Compact monospace rows, a hairline under the prompt, a rounded selection band, no
-keybind or quick-activation hints. Rows waiting on you get an inset amber accent
-bar; rows still working dim back.
+keybind or quick-activation hints. Rows still working dim back so the ones
+waiting on you stand out.
 
 Your normal launcher is untouched — the picker asks for this theme per-invocation
 with `walker --theme waybarclaude`.
@@ -47,16 +47,18 @@ tracking upstream.
 Walker's dmenu mode sets only an item's **text** — no icon field, no state class,
 and no pango markup (all three checked against the 2.16.2 source). One row is one
 label, so CSS cannot colour a row's icon, title and path separately the way a
-mockup can. Tinting the whole row amber was too loud, so waiting rows get an
-inset accent bar and keep readable text.
+mockup can. Tinting a whole row amber was too loud, and anything
+painted behind a waiting row (accent bar, background wash) competes with the
+selection band and reads as a second highlight. So the emphasis is subtractive:
+working rows recede, waiting rows keep full brightness, and the bell versus
+hourglass glyph carries the distinction.
 
 What walker *does* allow is re-reading the theme stylesheet on every invocation,
 so the picker writes `rows.css` immediately before launching with the current
 counts. Tune it from `~/.config/waybarclaude/config`:
 
 ```sh
-COLOR_WAITING='#e0af68'   # the accent
-DIM_RUNNING='0.55'        # opacity for rows still working
+DIM_RUNNING='0.55'            # opacity for rows still working
 WALKER_THEME='waybarclaude'   # set to '' to stop asking for this theme
 ```
 
