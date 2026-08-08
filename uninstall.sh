@@ -137,6 +137,29 @@ if [[ -f $SCSS ]] && grep -q 'claude-queue.css' -- "$SCSS"; then
 fi
 ((UNWIRE || UNCSS)) || info "nothing wired up"
 
+head1 "walker theme"
+WTDIR="$CFG/walker/themes"
+WTHEME="$WTDIR/waybarclaude"
+WCONF="$CFG/walker/config.toml"
+UNTHEME=0
+if [[ -f "$WTHEME/style.css" ]] && grep -q "$MARKER" -- "$WTHEME/style.css" 2>/dev/null; then
+  info "remove  $(short "$WTHEME")"
+  UNTHEME=1
+fi
+UNWCONF=0
+if [[ -f $WCONF ]] && grep -q "$MARKER" -- "$WCONF" 2>/dev/null; then
+  info "edit    $(short "$WCONF")  (restore additional_theme_location)"
+  UNWCONF=1
+fi
+WLINKS=()
+if [[ -d $WTDIR ]]; then
+  for l in "$WTDIR"/*; do
+    [[ -L $l ]] && WLINKS+=("$l")
+  done
+  ((${#WLINKS[@]})) && info "remove  ${#WLINKS[@]} theme symlink(s) we created"
+fi
+((UNTHEME || UNWCONF)) || info "no walker theme installed"
+
 head1 "daemon"
 SERVICE_PRESENT=0
 if command -v systemctl >/dev/null 2>&1 &&
@@ -263,6 +286,68 @@ if css_path and os.path.exists(css_path):
 PY
 elif ((UNWIRE || UNCSS)); then
   info "python3 not found; remove the claude-queue lines from your waybar config by hand"
+fi
+
+# --- walker theme ------------------------------------------------------------
+if ((UNTHEME)); then
+  # layout.xml is a verbatim copy of walker's own file so it carries no marker;
+  # the marked style.css beside it is what authorises removing the pair.
+  rm -f -- "$WTHEME/style.css" "$WTHEME/layout.xml"
+  rmdir -- "$WTHEME" 2>/dev/null &&
+    info "removed $(short "$WTHEME")" ||
+    info "kept    $(short "$WTHEME") (not empty)"
+fi
+
+if ((UNWCONF)); then
+  # Put additional_theme_location back where it pointed before, which the
+  # symlink target tells us; if we cannot tell, drop the line and let walker
+  # fall back to its own default theme.
+  orig=''
+  for l in "${WLINKS[@]}"; do
+    tgt=$(readlink -f -- "$l" 2>/dev/null) || continue
+    [[ -n $tgt ]] && orig=$(dirname -- "$tgt") && break
+  done
+  cp -p -- "$WCONF" "$WCONF.bak.$(date +%s)"
+  if [[ -n $orig ]]; then
+    python3 - "$WCONF" "$orig" <<'PYEOF'
+import os, re, sys
+p, orig = sys.argv[1:3]
+t = open(p).read()
+line = 'additional_theme_location = "%s/"' % orig.replace(os.path.expanduser('~'), '~')
+t = re.sub(r'^additional_theme_location\s*=.*waybarclaude:managed.*$', line, t, flags=re.M)
+open(p, 'w').write(t)
+PYEOF
+    info "restored additional_theme_location -> $(short "$orig")/"
+  else
+    python3 - "$WCONF" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+t = open(p).read()
+t = re.sub(r'^additional_theme_location\s*=.*waybarclaude:managed.*
+', '', t, flags=re.M)
+open(p, 'w').write(t)
+PYEOF
+    info "dropped the additional_theme_location line we added"
+  fi
+fi
+
+for l in "${WLINKS[@]:-}"; do
+  [[ -L $l ]] && rm -f -- "$l" && info "removed symlink $(short "$l")"
+done
+[[ -d $WTDIR ]] && rmdir -- "$WTDIR" 2>/dev/null && info "removed $(short "$WTDIR")"
+
+if ((UNTHEME || UNWCONF)); then
+  svc=$(pgrep -x walker 2>/dev/null | head -1) || svc=''
+  if [[ -n $svc ]]; then
+    kill "$svc" 2>/dev/null && sleep 1
+    if command -v uwsm-app >/dev/null 2>&1; then
+      setsid uwsm-app -- env GSK_RENDERER=cairo walker --gapplication-service >/dev/null 2>&1 &
+    else
+      setsid walker --gapplication-service >/dev/null 2>&1 &
+    fi
+    sleep 1
+    info "walker service restarted"
+  fi
 fi
 
 if ((STATE_OK)); then

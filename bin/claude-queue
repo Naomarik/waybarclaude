@@ -57,6 +57,9 @@ MENU=''          # empty = auto-detect; a known name, or a full command line
 MENU_WIDTH=900
 MENU_LINES=15
 MENU_PROMPT='Claude sessions…'
+# Walker theme to request for the picker. Installed by `install.sh --walker-theme`;
+# only passed if it is actually present, so an un-themed setup still works.
+WALKER_THEME='waybarclaude'
 
 CONFIG="${WBC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/waybarclaude/config}"
 # shellcheck source=/dev/null
@@ -68,6 +71,7 @@ SESSIONS_DIR="${WBC_SESSIONS_DIR:-$CLAUDE_DIR/sessions}"
 PROJECTS_DIR="${WBC_PROJECTS_DIR:-$CLAUDE_DIR/projects}"
 STATE="${WBC_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-queue}"
 MENU="${WBC_MENU:-$MENU}"
+WALKER_THEME="${WBC_WALKER_THEME-$WALKER_THEME}"
 
 QUEUE="$STATE/queue.tsv"
 ADDRS="$STATE/addrs" # one line of queued window addresses; the daemon's hot path
@@ -469,6 +473,18 @@ tilde() {
   printf '%s' "${v/#"$HOME"/\~}"
 }
 
+# Claude prefixes the terminal title with a status marker: a braille spinner while
+# busy, an asterisk when idle. We already show our own icon, so drop it. A leading
+# token containing no alphanumerics is the marker; anything else is real title text.
+strip_marker() {
+  local t=$1 head=${t%% *}
+  if [[ -n $head && $head != "$t" && ! $head =~ [[:alnum:]] ]]; then
+    printf '%s' "${t#* }"
+  else
+    printf '%s' "$t"
+  fi
+}
+
 cmd_status() {
   local sid addr t name cwd ts title running=0 waiting=0 text='' class='' tip='' l
   local -a flight=() wait_lines=()
@@ -486,7 +502,7 @@ cmd_status() {
       t=${W_TITLE[$addr]:-}
     fi
     [[ -n $t ]] || t=$title
-    wait_lines+=("$t  ·  $(tilde "$cwd")")
+    wait_lines+=("$(strip_marker "$t")  ·  $(tilde "$cwd")")
   done <"$QUEUE"
 
   for sid in "${ROSTER_IDS[@]:-}"; do
@@ -500,7 +516,7 @@ cmd_status() {
       t=${W_TITLE[$addr]:-}
     fi
     [[ -n $t ]] || t=${R_NAME[$sid]}
-    flight+=("$t  ·  $(tilde "${R_CWD[$sid]}")")
+    flight+=("$(strip_marker "$t")  ·  $(tilde "${R_CWD[$sid]}")")
   done
 
   if ((running == 0 && waiting == 0)); then
@@ -558,17 +574,26 @@ detect_menu() {
 }
 
 # Reads candidate lines on stdin, prints the chosen line.
+# --theme is only passed when the theme is really installed; walker prints
+# "theme not found" and falls back otherwise, which would be noise.
+walker_theme_args() {
+  local d="${XDG_CONFIG_HOME:-$HOME/.config}/walker/themes/$WALKER_THEME"
+  [[ -n $WALKER_THEME && -f "$d/layout.xml" ]] && printf '%s' "--theme $WALKER_THEME"
+}
+
 run_menu() {
   local m
   m=$(detect_menu) || return 1
   case $m in
   omarchy-walker)
-    omarchy-launch-walker --dmenu --width "$MENU_WIDTH" --minheight 1 \
-      --maxheight 630 -p "$MENU_PROMPT"
+    # shellcheck disable=SC2046
+    omarchy-launch-walker --dmenu $(walker_theme_args) --width "$MENU_WIDTH" \
+      --minheight 1 --maxheight 630 -p "$MENU_PROMPT"
     ;;
   walker)
-    walker --dmenu --width "$MENU_WIDTH" --minheight 1 --maxheight 630 \
-      -p "$MENU_PROMPT"
+    # shellcheck disable=SC2046
+    walker --dmenu $(walker_theme_args) --width "$MENU_WIDTH" --minheight 1 \
+      --maxheight 630 -p "$MENU_PROMPT"
     ;;
   fuzzel) fuzzel --dmenu --prompt "$MENU_PROMPT " ;;
   rofi) rofi -dmenu -i -p "$MENU_PROMPT" ;;
@@ -593,7 +618,7 @@ cmd_menu() {
     t=''
     [[ -n $addr ]] && t=${W_TITLE[$addr]:-}
     [[ -n $t ]] || t=$title
-    label="$ICON_WAITING  $t   ·  $(tilde "$cwd")"
+    label="$ICON_WAITING  $(strip_marker "$t")   ·  $(tilde "$cwd")"
     while [[ -n ${PICK[$label]:-} ]]; do label+=' '; done
     PICK[$label]="q$SEP$sid$SEP$addr"
     lines+=("$label")
@@ -606,7 +631,7 @@ cmd_menu() {
     t=''
     [[ -n $addr ]] && t=${W_TITLE[$addr]:-}
     [[ -n $t ]] || t=${R_NAME[$sid]}
-    label="$ICON_RUNNING  $t   ·  $(tilde "${R_CWD[$sid]}")"
+    label="$ICON_RUNNING  $(strip_marker "$t")   ·  $(tilde "${R_CWD[$sid]}")"
     while [[ -n ${PICK[$label]:-} ]]; do label+=' '; done
     PICK[$label]="r$SEP$sid$SEP$addr"
     lines+=("$label")

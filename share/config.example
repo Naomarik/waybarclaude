@@ -29,3 +29,8 @@
 #MENU_WIDTH=900
 #MENU_LINES=15
 #MENU_PROMPT='Claude sessions…'
+
+# Walker theme requested for the picker, installed by `install.sh --walker-theme`.
+# It is only passed to walker if the theme is actually present, so leaving this
+# alone is harmless. Set it to '' to always use whatever theme walker defaults to.
+#WALKER_THEME='waybarclaude'

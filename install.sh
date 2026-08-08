@@ -9,6 +9,7 @@
 #   ./install.sh --wire          also make those edits for you (with backups)
 #   ./install.sh --check         report what is installed and wired, change nothing
 #   ./install.sh --no-service    skip the systemd user unit
+#   ./install.sh --walker-theme  style the picker (edits walker/config.toml)
 #   ./install.sh --prefix DIR    default $HOME/.local
 
 set -euo pipefail
@@ -23,7 +24,7 @@ SYSTEMD_DIR="$CFG/systemd/user"
 HYPR_DIR="$CFG/hypr"
 WBC_CFG_DIR="$CFG/waybarclaude"
 
-DO_WIRE=0 DO_SERVICE=1 CHECK_ONLY=0 POSITION=right
+DO_WIRE=0 DO_SERVICE=1 CHECK_ONLY=0 POSITION=right DO_WALKER_THEME=0
 
 die() {
   printf '\033[31merror\033[0m %s\n' "$*" >&2
@@ -35,6 +36,7 @@ head1() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 while (($#)); do
   case $1 in
   --wire) DO_WIRE=1 ;;
+  --walker-theme) DO_WALKER_THEME=1 ;;
   --no-service) DO_SERVICE=0 ;;
   --check) CHECK_ONLY=1 ;;
   --position)
@@ -46,7 +48,7 @@ while (($#)); do
     shift
     ;;
   -h | --help)
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *) die "unknown option: $1" ;;
@@ -179,6 +181,115 @@ do_service() {
     info "waybarclaude.service is running"
   else
     info "waybarclaude.service is enabled but not active yet"
+  fi
+}
+
+# --- walker theme ------------------------------------------------------------
+# Walker only looks for themes in XDG_CONFIG_DIRS and in the single
+# `additional_theme_location` from its config, and resolves them in the *service*
+# process, so a per-invocation env var cannot inject one. To get a themed picker
+# without changing your normal launcher's look we therefore:
+#   1. put our theme in ~/.config/walker/themes/  (yours, survives distro updates)
+#   2. symlink whatever themes the current location holds into there, so they keep
+#      resolving -- through the symlink they also keep tracking their upstream
+#   3. point additional_theme_location at ~/.config/walker/themes/
+#   4. ask for it per-invocation with `walker --theme waybarclaude`
+# Only step 3 touches a file you own; if something later resets it, walker just
+# falls back to its default theme and the picker still works.
+WALKER_THEME_NAME=waybarclaude
+
+walker_theme() {
+  ((DO_WALKER_THEME)) || return 0
+  head1 "walker theme"
+  command -v walker >/dev/null 2>&1 || { info "walker not installed, skipping"; return 0; }
+
+  local wcfg="$CFG/walker/config.toml"
+  local tdir="$CFG/walker/themes"
+  local dst="$tdir/$WALKER_THEME_NAME"
+  mkdir -p -- "$dst"
+
+  # layout.xml: copy from a theme this walker install already ships, so we inherit
+  # the widget schema of the installed version instead of pinning our own.
+  local src='' c
+  for c in "$tdir"/*/layout.xml \
+    "$HOME/.local/share/omarchy/default/walker/themes/omarchy-default/layout.xml" \
+    /etc/xdg/walker/themes/default/layout.xml \
+    /usr/share/walker/themes/default/layout.xml; do
+    [[ -f $c && $c != "$dst/layout.xml" ]] && { src=$c; break; }
+  done
+  [[ -n $src ]] || { info "no walker layout.xml found to base the theme on, skipping"; return 0; }
+  install -m 644 -- "$src" "$dst/layout.xml"
+  info "layout from $(short "$src")"
+
+  # colours: follow the desktop theme when it exposes walker colours
+  local colours theme_css="$CFG/omarchy/current/theme/walker.css"
+  if [[ -f $theme_css ]]; then
+    colours="@import url(\"file://$theme_css\");"
+    info "colours follow $(short "$theme_css")"
+  else
+    colours=$'@define-color base #1a1b26;\n@define-color text #c0caf5;\n@define-color border #2f3549;\n@define-color selected-text #7aa2f7;\n@define-color background #1a1b26;\n@define-color foreground #c0caf5;'
+    info "colours: built-in fallback palette"
+  fi
+  local tmp
+  tmp=$(mktemp)
+  python3 - "$REPO/share/walker/style.css" "$tmp" "$colours" <<'PYEOF'
+import sys
+src, dst, colours = sys.argv[1:4]
+open(dst, 'w').write(open(src).read().replace('@COLORS@', colours))
+PYEOF
+  install_file "$tmp" "$dst/style.css" 644
+  rm -f -- "$tmp"
+
+  # keep the themes from the current location resolvable from the new one
+  local cur
+  cur=$(sed -n 's/^additional_theme_location[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$wcfg" 2>/dev/null | head -1)
+  cur=${cur/#\~/$HOME}
+  if [[ -n $cur && -d $cur && $cur != "$tdir" && $cur != "$tdir/" ]]; then
+    local d
+    for d in "$cur"/*/; do
+      [[ -d $d ]] || continue
+      d=${d%/}
+      ln -sfn -- "$d" "$tdir/${d##*/}"
+      info "linked ${d##*/} -> $(short "$d")"
+    done
+  fi
+
+  # point walker at the new location
+  if [[ -f $wcfg ]]; then
+    if grep -q "waybarclaude:managed" -- "$wcfg" 2>/dev/null; then
+      info "config.toml already points here"
+    else
+      cp -p -- "$wcfg" "$wcfg.bak.$(date +%s)"
+      python3 - "$wcfg" "$tdir" <<'PYEOF'
+import re, sys
+p, tdir = sys.argv[1:3]
+t = open(p).read()
+line = 'additional_theme_location = "%s/"  # waybarclaude:managed' % tdir.replace(__import__('os').path.expanduser('~'), '~')
+if re.search(r'^additional_theme_location\s*=', t, re.M):
+    t = re.sub(r'^additional_theme_location\s*=.*$', line, t, count=1, flags=re.M)
+else:
+    t = line + '\n' + t
+open(p, 'w').write(t)
+PYEOF
+      info "config.toml: additional_theme_location -> $(short "$tdir")/ (backed up)"
+    fi
+  else
+    printf 'additional_theme_location = "~/.config/walker/themes/"  # waybarclaude:managed\n' >"$wcfg"
+    info "created $(short "$wcfg")"
+  fi
+
+  # the walker service caches its config; restart it so the theme is visible
+  local svc
+  svc=$(pgrep -x walker 2>/dev/null | head -1) || svc=''
+  if [[ -n $svc ]]; then
+    kill "$svc" 2>/dev/null && sleep 1
+    if command -v uwsm-app >/dev/null 2>&1; then
+      setsid uwsm-app -- env GSK_RENDERER=cairo walker --gapplication-service >/dev/null 2>&1 &
+    else
+      setsid walker --gapplication-service >/dev/null 2>&1 &
+    fi
+    sleep 1
+    info "walker service restarted"
   fi
 }
 
@@ -393,6 +504,7 @@ if ((DO_WIRE)); then
 else
   print_wiring
 fi
+walker_theme
 
 head1 "status"
 "$BIN_DIR/claude-queue" doctor || true

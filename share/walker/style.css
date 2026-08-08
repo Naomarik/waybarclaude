@@ -1,0 +1,84 @@
+/* waybarclaude:managed
+ *
+ * Walker theme for the waybarclaude picker only. Installed by
+ * `install.sh --walker-theme` into ~/.config/walker/themes/waybarclaude/, and
+ * requested per-invocation with `walker --theme waybarclaude`, so your normal
+ * launcher keeps whatever theme you already use.
+ *
+ * @COLORS@ is filled in at install time: an @import of your desktop theme's
+ * walker colours when one is found, otherwise a self-contained fallback palette.
+ * Either way the variable names below are the ones walker themes conventionally
+ * use, so switching desktop themes recolours this too.
+ */
+@COLORS@
+
+* {
+  all: unset;
+  font-family: monospace;
+  font-size: 14px;
+  color: @text;
+}
+
+scrollbar {
+  opacity: 0;
+}
+
+/* The panel: opaque, so terminal text behind it does not bleed through and make
+   the list hard to read, which is the main thing that makes a launcher feel
+   cluttered over a busy screen. */
+.box-wrapper {
+  background: @base;
+  padding: 6px;
+  border: 1px solid alpha(@text, 0.16);
+  border-radius: 12px;
+}
+
+/* A hairline under the prompt separates query from results. */
+.search-container {
+  padding: 11px 16px 12px 16px;
+  border-bottom: 1px solid alpha(@text, 0.10);
+}
+
+.input placeholder {
+  opacity: 0.4;
+}
+
+.item-box {
+  padding-left: 12px;
+  padding-right: 12px;
+  border-radius: 8px;
+}
+
+.item-text-box {
+  all: unset;
+  padding: 9px 0;
+}
+
+/* dmenu rows carry no subtext; collapse it so rows stay compact. */
+.item-subtext {
+  font-size: 0px;
+  min-height: 0px;
+  margin: 0;
+  padding: 0;
+}
+
+/* Rounded selection band, and the text keeps its colour rather than switching to
+   an accent, so the row reads the same selected or not. */
+child:selected {
+  background: alpha(@text, 0.08);
+  border-radius: 8px;
+}
+
+child:selected .item-box * {
+  color: @text;
+}
+
+/* No keybind or quick-activation hints: the list is the whole interface. */
+.keybinds,
+.keybind-hints,
+.item-keybinds,
+.global-keybinds {
+  opacity: 0;
+  font-size: 0px;
+  min-height: 0px;
+}

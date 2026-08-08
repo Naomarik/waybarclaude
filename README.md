@@ -95,6 +95,46 @@ if you copy them by hand.
 
 </details>
 
+## A nicer picker (optional)
+
+Walker's default look leans transparent with large rows, which gets hard to read
+over a busy screen. `--walker-theme` installs a small theme for **the picker
+only** — opaque panel, compact monospace rows, a hairline under the prompt:
+
+```sh
+./install.sh --walker-theme
+```
+
+Your normal launcher keeps the theme it already has, because the picker asks for
+its own per-invocation with `walker --theme waybarclaude`.
+
+<details>
+<summary><b>Why this needs one line of your walker config</b></summary>
+
+Walker looks for themes in `XDG_CONFIG_DIRS` and in the single
+`additional_theme_location` from its config, and it resolves them in the
+**service** process — so a per-invocation environment variable cannot inject one,
+and `additional_theme_location` only accepts one path (not a list). So the
+installer:
+
+1. puts the theme in `~/.config/walker/themes/` — yours, and untouched by distro updates
+2. symlinks whatever themes your current location holds into there, so they keep
+   resolving; through the symlink they also keep tracking their upstream, so a
+   distro update to those themes still reaches you
+3. points `additional_theme_location` at `~/.config/walker/themes/` (backing the
+   file up first)
+
+Only step 3 touches a file you own, and it degrades safely: if anything later
+resets that config — `omarchy refresh walker`, say — walker just falls back to its
+own default theme and the picker keeps working. Re-run `./install.sh
+--walker-theme` to reapply. `./uninstall.sh` restores the original value.
+
+Colours come from an `@import` of your desktop theme's walker colours when one is
+found, so switching desktop themes recolours the picker too. Otherwise a
+self-contained palette is used.
+
+</details>
+
 ## Requirements
 
 - **Hyprland** — the compositor-specific code is four functions at the top of
