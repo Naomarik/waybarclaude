@@ -86,9 +86,10 @@ child:selected .item-box * {
 
 /* Per-row emphasis. Walker's dmenu mode sets only an item's *text* -- no icon
  * field, no state class, and no pango markup -- so one row is one label and CSS
- * cannot colour its icon, title and path separately. Tinting the whole row amber
- * is too loud, so waiting rows instead get an inset amber accent bar and keep
- * readable text, while working rows dim back.
+ * cannot colour its icon, title and path separately. Painting anything behind a
+ * waiting row also collides with the selection band and reads as a second
+ * highlight, so emphasis here is subtractive: working rows recede, waiting rows
+ * keep full brightness, and the bell versus hourglass glyph does the rest.
  *
  * What walker does allow is re-reading this stylesheet on every invocation, so the
  * picker writes rows.css immediately before launching with the current counts.

@@ -42,7 +42,7 @@ undefined, and its window renders transparent. Each shim is therefore a
 relative import still resolves from where it actually lives — and it keeps
 tracking upstream.
 
-## Why the accent bar instead of amber text
+## Why there is no amber, and no per-row highlight
 
 Walker's dmenu mode sets only an item's **text** — no icon field, no state class,
 and no pango markup (all three checked against the 2.16.2 source). One row is one
