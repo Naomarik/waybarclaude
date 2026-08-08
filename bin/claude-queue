@@ -60,8 +60,8 @@ MENU_PROMPT='Claude sessions…'
 # Walker theme to request for the picker. Installed by `install.sh --walker-theme`;
 # only passed if it is actually present, so an un-themed setup still works.
 WALKER_THEME='waybarclaude'
-COLOR_WAITING='#e0af68' # amber tint for rows waiting on you, in the picker
-DIM_RUNNING='0.62'      # opacity for rows still working
+COLOR_WAITING='#e0af68' # accent for rows waiting on you, in the picker
+DIM_RUNNING='0.55'      # opacity for rows still working
 
 CONFIG="${WBC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/waybarclaude/config}"
 # shellcheck source=/dev/null
@@ -587,7 +587,9 @@ write_row_css() {
   f="$d/rows.css"
   [[ -d $d && -w $d ]] || return 0
   if ((waiting > 0)); then
-    printf 'child:nth-child(-n+%d) .item-text { color: %s; }\nchild:nth-child(n+%d) .item-text { opacity: %s; }\n' \
+    # inset box-shadow rather than border-left: no layout shift, and it follows
+    # the row's corner radius
+    printf 'child:nth-child(-n+%d) .item-box { box-shadow: inset 2px 0 0 %s; }\nchild:nth-child(n+%d) .item-text { opacity: %s; }\n' \
       "$waiting" "$COLOR_WAITING" "$((waiting + 1))" "$DIM_RUNNING" >"$f"
   else
     : >"$f"

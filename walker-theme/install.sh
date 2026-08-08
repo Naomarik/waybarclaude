@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# waybarclaude walker theme -- optional add-on.
+#
+# Styles the waybarclaude picker only: opaque panel, compact monospace rows, a
+# hairline under the prompt, and the rows waiting on you tinted amber while the
+# working ones dim back. Your normal launcher keeps the theme it already uses,
+# because the picker asks for this one per-invocation with `walker --theme`.
+#
+# Separate from the main installer on purpose: this is the one part that has to
+# touch a config file you own (walker's), so it is opt in and opt out on its own.
+#
+#   ./install.sh            install the theme
+#   ./install.sh --check    report what is installed, change nothing
+#
+# Remove it with ./uninstall.sh in this directory. The main waybarclaude
+# uninstaller deliberately leaves it alone.
+
+set -euo pipefail
+
+HERE=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)
+MARKER='waybarclaude:managed'
+THEME_NAME=waybarclaude
+
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}"
+WCONF="$CFG/walker/config.toml"
+TDIR="$CFG/walker/themes"
+DST="$TDIR/$THEME_NAME"
+
+CHECK_ONLY=0
+while (($#)); do
+  case $1 in
+  --check) CHECK_ONLY=1 ;;
+  -h | --help)
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *)
+    printf 'unknown option: %s\n' "$1" >&2
+    exit 1
+    ;;
+  esac
+  shift
+done
+
+info() { printf '  %s\n' "$*"; }
+head1() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+short() { printf '%s' "${1/#"$HOME"/\~}"; }
+die() {
+  printf '\033[31merror\033[0m %s\n' "$*" >&2
+  exit 1
+}
+
+# Copy src to dst, backing up an existing dst we did not write ourselves.
+install_file() {
+  local src=$1 dst=$2 mode=$3 bak
+  mkdir -p -- "$(dirname -- "$dst")"
+  if [[ -e $dst ]]; then
+    [[ -L $dst ]] && die "$dst is a symlink; refusing to overwrite it"
+    if ! grep -q "$MARKER" -- "$dst" 2>/dev/null; then
+      bak="$dst.bak.$(date +%s)"
+      cp -p -- "$dst" "$bak"
+      info "backed up $(short "$dst") -> $(short "$bak")"
+    fi
+  fi
+  install -m "$mode" -- "$src" "$dst"
+}
+
+restart_walker() {
+  local svc
+  svc=$(pgrep -x walker 2>/dev/null | head -1) || svc=''
+  [[ -n $svc ]] || return 0
+  # Walker caches its config in the service process, so the new theme location is
+  # only visible after a restart. The stylesheet itself is re-read per launch.
+  kill "$svc" 2>/dev/null && sleep 1
+  if command -v uwsm-app >/dev/null 2>&1; then
+    setsid uwsm-app -- env GSK_RENDERER=cairo walker --gapplication-service >/dev/null 2>&1 &
+  else
+    setsid walker --gapplication-service >/dev/null 2>&1 &
+  fi
+  sleep 1
+  info "walker service restarted"
+}
+
+do_check() {
+  head1 "walker theme"
+  if [[ -f "$DST/style.css" ]] && grep -q "$MARKER" -- "$DST/style.css" 2>/dev/null; then
+    info "ok      $(short "$DST")"
+  else
+    info "absent  $(short "$DST")"
+  fi
+  if [[ -f $WCONF ]] && grep -q "$MARKER" -- "$WCONF" 2>/dev/null; then
+    info "ok      walker config points at $(short "$TDIR")/"
+  else
+    info "absent  walker config not pointed here"
+  fi
+  local n=0 d
+  for d in "$TDIR"/*/; do
+    d=${d%/}
+    [[ ${d##*/} == "$THEME_NAME" ]] && continue
+    [[ -f "$d/style.css" ]] && grep -q "$MARKER" -- "$d/style.css" 2>/dev/null && ((n++)) || :
+  done
+  info "shims   $n other theme(s) migrated"
+}
+
+if ((CHECK_ONLY)); then
+  do_check
+  exit 0
+fi
+
+command -v walker >/dev/null 2>&1 || die "walker is not installed"
+command -v python3 >/dev/null 2>&1 || die "needs python3 to edit walker's config safely"
+
+head1 "installing walker theme"
+mkdir -p -- "$DST"
+
+# layout.xml: copied from a theme this walker install already ships, so we inherit
+# the widget schema of the installed version rather than pinning our own.
+src=''
+for c in "$TDIR"/*/layout.xml \
+  "$HOME/.local/share/omarchy/default/walker/themes/omarchy-default/layout.xml" \
+  /etc/xdg/walker/themes/default/layout.xml \
+  /usr/share/walker/themes/default/layout.xml; do
+  [[ -f $c && $c != "$DST/layout.xml" ]] && {
+    src=$c
+    break
+  }
+done
+[[ -n $src ]] || die "no walker layout.xml found to base the theme on"
+install -m 644 -- "$src" "$DST/layout.xml"
+info "layout from $(short "$src")"
+
+# Colours follow the desktop theme when it exposes walker colours, so switching
+# desktop themes recolours the picker too.
+theme_css="$CFG/omarchy/current/theme/walker.css"
+if [[ -f $theme_css ]]; then
+  colours="@import url(\"file://$theme_css\");"
+  info "colours follow $(short "$theme_css")"
+else
+  colours=$'@define-color base #1a1b26;\n@define-color text #c0caf5;\n@define-color border #2f3549;\n@define-color selected-text #7aa2f7;\n@define-color background #1a1b26;\n@define-color foreground #c0caf5;'
+  info "colours: built-in fallback palette"
+fi
+tmp=$(mktemp)
+python3 - "$HERE/style.css" "$tmp" "$colours" <<'PYEOF'
+import sys
+src, dst, colours = sys.argv[1:4]
+open(dst, 'w').write(open(src).read().replace('@COLORS@', colours))
+PYEOF
+install_file "$tmp" "$DST/style.css" 644
+rm -f -- "$tmp"
+info "installed $(short "$DST/style.css")"
+
+# Regenerated by the picker on every launch; must exist so its @import resolves.
+[[ -f "$DST/rows.css" ]] ||
+  printf '/* %s: regenerated on every picker launch */\n' "$MARKER" >"$DST/rows.css"
+
+# Keep the themes from the old location working from the new one. A symlink is NOT
+# enough: a theme whose style.css imports its colours by relative path (omarchy's
+# does, with seven ../) would resolve that path from the symlink's depth, the
+# import would fail, its colours would be undefined and its window would render
+# transparent. Each one therefore gets a shim whose stylesheet imports the original
+# by absolute path, so the original's own relative import resolves from where it
+# really lives -- and it keeps tracking upstream.
+cur=$(sed -n 's/^additional_theme_location[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$WCONF" 2>/dev/null | head -1)
+cur=${cur/#\~/$HOME}
+cur=${cur%/}
+if [[ -n $cur && -d $cur && $cur != "${TDIR%/}" ]]; then
+  for d in "$cur"/*/; do
+    [[ -d $d ]] || continue
+    d=${d%/}
+    name=${d##*/}
+    [[ $name == "$THEME_NAME" ]] && continue
+    if [[ -f "$d/style.scss" ]]; then
+      info "skipped $name (uses style.scss, which cannot be shimmed)"
+      continue
+    fi
+    [[ -f "$d/style.css" && -f "$d/layout.xml" ]] || continue
+    mkdir -p -- "$TDIR/$name"
+    ln -sfn -- "$d/layout.xml" "$TDIR/$name/layout.xml"
+    printf '/* %s */\n@import url("file://%s/style.css");\n' "$MARKER" "$d" \
+      >"$TDIR/$name/style.css"
+    info "shimmed $name -> $(short "$d")"
+  done
+fi
+
+# Point walker at the new location. This is the only file of yours we touch.
+if [[ -f $WCONF ]]; then
+  if grep -q "$MARKER" -- "$WCONF" 2>/dev/null; then
+    info "walker config already points here"
+  else
+    cp -p -- "$WCONF" "$WCONF.bak.$(date +%s)"
+    python3 - "$WCONF" "$TDIR" <<'PYEOF'
+import os, re, sys
+p, tdir = sys.argv[1:3]
+t = open(p).read()
+line = 'additional_theme_location = "%s/"  # waybarclaude:managed' % \
+    tdir.replace(os.path.expanduser('~'), '~')
+if re.search(r'^additional_theme_location\s*=', t, re.M):
+    t = re.sub(r'^additional_theme_location\s*=.*$', line, t, count=1, flags=re.M)
+else:
+    t = line + '\n' + t
+open(p, 'w').write(t)
+PYEOF
+    info "walker config: additional_theme_location -> $(short "$TDIR")/ (backed up)"
+  fi
+else
+  mkdir -p -- "$(dirname -- "$WCONF")"
+  printf 'additional_theme_location = "~/.config/walker/themes/"  # waybarclaude:managed\n' >"$WCONF"
+  info "created $(short "$WCONF")"
+fi
+
+restart_walker
+do_check
+printf '\ndone. remove it with %s/uninstall.sh\n' "$(short "$HERE")"

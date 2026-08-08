@@ -98,58 +98,22 @@ if you copy them by hand.
 ## A nicer picker (optional)
 
 Walker's default look leans transparent with large rows, which gets hard to read
-over a busy screen. `--walker-theme` installs a small theme for **the picker
-only** — opaque panel, compact monospace rows, a hairline under the prompt, and
-the rows waiting on you tinted amber while the working ones dim back:
+over a busy screen. There is a small theme for **the picker only** — opaque panel,
+compact monospace rows, a hairline under the prompt, and an amber accent bar on the
+rows waiting on you:
 
 ```sh
-./install.sh --walker-theme
+./walker-theme/install.sh
 ```
 
-Your normal launcher keeps the theme it already has, because the picker asks for
-its own per-invocation with `walker --theme waybarclaude`.
+It installs and removes **separately** from waybarclaude itself, because it is the
+one piece that has to edit a config file you own (walker's). Your normal launcher
+keeps the theme it already uses. See [walker-theme/README.md](walker-theme/README.md)
+for what it changes, why that one line is needed, and how to tune the colours.
 
-<details>
-<summary><b>Why this needs one line of your walker config</b></summary>
-
-Walker looks for themes in `XDG_CONFIG_DIRS` and in the single
-`additional_theme_location` from its config, and it resolves them in the
-**service** process — so a per-invocation environment variable cannot inject one,
-and `additional_theme_location` only accepts one path (not a list). So the
-installer:
-
-1. puts the theme in `~/.config/walker/themes/` — yours, and untouched by distro updates
-2. symlinks whatever themes your current location holds into there, so they keep
-   resolving; through the symlink they also keep tracking their upstream, so a
-   distro update to those themes still reaches you
-3. points `additional_theme_location` at `~/.config/walker/themes/` (backing the
-   file up first)
-
-Only step 3 touches a file you own, and it degrades safely: if anything later
-resets that config — `omarchy refresh walker`, say — walker just falls back to its
-own default theme and the picker keeps working. Re-run `./install.sh
---walker-theme` to reapply. `./uninstall.sh` restores the original value.
-
-Colours come from an `@import` of your desktop theme's walker colours when one is
-found, so switching desktop themes recolours the picker too. Otherwise a
-self-contained palette is used.
-
-**Symlinks are deliberately not used for step 2.** A theme whose `style.css`
-imports its colours by *relative* path — omarchy's does, with seven `../` — would
-resolve that path from the symlink's depth instead of its real one. The import
-fails, its colours end up undefined, and its window renders transparent. Each
-migrated theme therefore gets a shim: a `style.css` that imports the original by
-absolute path, so the original's own relative import still resolves from where it
-actually lives.
-
-**How the amber rows work.** Walker's dmenu mode sets only an item's text — no
-per-row icon, no state class, and no pango markup (all three verified against the
-2.16.2 source). What it does do is re-read the theme stylesheet on every
-invocation, so the picker writes a small generated `rows.css` immediately before
-launching, tinting the first N rows and dimming the rest. Configure the colour
-with `COLOR_WAITING` and the dimming with `DIM_RUNNING`.
-
-</details>
+```sh
+./walker-theme/uninstall.sh    # restores walker's config
+```
 
 ## Requirements
 
@@ -268,6 +232,9 @@ timer.
 ./uninstall.sh --dry-run    # just show the plan
 ./uninstall.sh --purge      # also delete the queue state
 ```
+
+The walker theme is a separate package, so this leaves it alone and says so; use
+`./walker-theme/uninstall.sh` for that.
 
 Deliberately paranoid, because uninstallers that guess are how people lose
 configs. It touches only an explicit list of paths, refuses to delete any file

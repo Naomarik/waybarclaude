@@ -84,10 +84,14 @@ child:selected .item-box * {
   min-height: 0px;
 }
 
-/* Per-row tinting. Walker's dmenu mode sets only an item's text -- no icon, no
- * state, and no pango markup -- so a row cannot carry its own colour. What it can
- * do is re-read this stylesheet on every invocation, so the picker writes
- * rows.css just before it launches, tinting the first N rows (the ones waiting on
- * you) amber and dimming the rest. Generated, and empty when nothing is waiting.
+/* Per-row emphasis. Walker's dmenu mode sets only an item's *text* -- no icon
+ * field, no state class, and no pango markup -- so one row is one label and CSS
+ * cannot colour its icon, title and path separately. Tinting the whole row amber
+ * is too loud, so waiting rows instead get an inset amber accent bar and keep
+ * readable text, while working rows dim back.
+ *
+ * What walker does allow is re-reading this stylesheet on every invocation, so the
+ * picker writes rows.css immediately before launching with the current counts.
+ * Generated; empty when nothing is waiting.
  */
 @import url("rows.css");
