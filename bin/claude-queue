@@ -60,6 +60,8 @@ MENU_PROMPT='Claude sessions…'
 # Walker theme to request for the picker. Installed by `install.sh --walker-theme`;
 # only passed if it is actually present, so an un-themed setup still works.
 WALKER_THEME='waybarclaude'
+COLOR_WAITING='#e0af68' # amber tint for rows waiting on you, in the picker
+DIM_RUNNING='0.62'      # opacity for rows still working
 
 CONFIG="${WBC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/waybarclaude/config}"
 # shellcheck source=/dev/null
@@ -576,6 +578,22 @@ detect_menu() {
 # Reads candidate lines on stdin, prints the chosen line.
 # --theme is only passed when the theme is really installed; walker prints
 # "theme not found" and falls back otherwise, which would be noise.
+# Walker re-reads the theme stylesheet on each invocation, so writing this file
+# immediately before launching is what lets rows differ from one another at all.
+# $1 = number of leading rows that are waiting on you.
+write_row_css() {
+  local waiting=$1 d f
+  d="${XDG_CONFIG_HOME:-$HOME/.config}/walker/themes/$WALKER_THEME"
+  f="$d/rows.css"
+  [[ -d $d && -w $d ]] || return 0
+  if ((waiting > 0)); then
+    printf 'child:nth-child(-n+%d) .item-text { color: %s; }\nchild:nth-child(n+%d) .item-text { opacity: %s; }\n' \
+      "$waiting" "$COLOR_WAITING" "$((waiting + 1))" "$DIM_RUNNING" >"$f"
+  else
+    : >"$f"
+  fi
+}
+
 walker_theme_args() {
   local d="${XDG_CONFIG_HOME:-$HOME/.config}/walker/themes/$WALKER_THEME"
   [[ -n $WALKER_THEME && -f "$d/layout.xml" ]] && printf '%s' "--theme $WALKER_THEME"
@@ -608,7 +626,7 @@ run_menu() {
 cmd_menu() {
   local -a lines=()
   local -A PICK=()
-  local sid addr name cwd ts title label t kind entry sel
+  local sid addr name cwd ts title label t kind entry sel waiting=0
 
   cmd_sync
   load_windows
@@ -622,6 +640,7 @@ cmd_menu() {
     while [[ -n ${PICK[$label]:-} ]]; do label+=' '; done
     PICK[$label]="q$SEP$sid$SEP$addr"
     lines+=("$label")
+    ((waiting++))
   done <"$QUEUE"
 
   for sid in "${ROSTER_IDS[@]:-}"; do
@@ -642,6 +661,7 @@ cmd_menu() {
     return 0
   fi
 
+  write_row_css "$waiting"
   sel=$(printf '%s\n' "${lines[@]}" | run_menu 2>/dev/null) || return 0
   [[ -n $sel ]] || return 0
 

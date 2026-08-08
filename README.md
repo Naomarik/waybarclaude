@@ -99,7 +99,8 @@ if you copy them by hand.
 
 Walker's default look leans transparent with large rows, which gets hard to read
 over a busy screen. `--walker-theme` installs a small theme for **the picker
-only** — opaque panel, compact monospace rows, a hairline under the prompt:
+only** — opaque panel, compact monospace rows, a hairline under the prompt, and
+the rows waiting on you tinted amber while the working ones dim back:
 
 ```sh
 ./install.sh --walker-theme
@@ -132,6 +133,21 @@ own default theme and the picker keeps working. Re-run `./install.sh
 Colours come from an `@import` of your desktop theme's walker colours when one is
 found, so switching desktop themes recolours the picker too. Otherwise a
 self-contained palette is used.
+
+**Symlinks are deliberately not used for step 2.** A theme whose `style.css`
+imports its colours by *relative* path — omarchy's does, with seven `../` — would
+resolve that path from the symlink's depth instead of its real one. The import
+fails, its colours end up undefined, and its window renders transparent. Each
+migrated theme therefore gets a shim: a `style.css` that imports the original by
+absolute path, so the original's own relative import still resolves from where it
+actually lives.
+
+**How the amber rows work.** Walker's dmenu mode sets only an item's text — no
+per-row icon, no state class, and no pango markup (all three verified against the
+2.16.2 source). What it does do is re-read the theme stylesheet on every
+invocation, so the picker writes a small generated `rows.css` immediately before
+launching, tinting the first N rows and dimming the rest. Configure the colour
+with `COLOR_WAITING` and the dimming with `DIM_RUNNING`.
 
 </details>
 

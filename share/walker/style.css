@@ -77,8 +77,17 @@ child:selected .item-box * {
 .keybinds,
 .keybind-hints,
 .item-keybinds,
-.global-keybinds {
+.global-keybinds,
+.item-quick-activation {
   opacity: 0;
   font-size: 0px;
   min-height: 0px;
 }
+
+/* Per-row tinting. Walker's dmenu mode sets only an item's text -- no icon, no
+ * state, and no pango markup -- so a row cannot carry its own colour. What it can
+ * do is re-read this stylesheet on every invocation, so the picker writes
+ * rows.css just before it launches, tinting the first N rows (the ones waiting on
+ * you) amber and dimming the rest. Generated, and empty when nothing is waiting.
+ */
+@import url("rows.css");

@@ -151,12 +151,16 @@ if [[ -f $WCONF ]] && grep -q "$MARKER" -- "$WCONF" 2>/dev/null; then
   info "edit    $(short "$WCONF")  (restore additional_theme_location)"
   UNWCONF=1
 fi
-WLINKS=()
+# Shim directories we created: a marked style.css beside a symlinked layout.xml.
+WSHIMS=()
 if [[ -d $WTDIR ]]; then
-  for l in "$WTDIR"/*; do
-    [[ -L $l ]] && WLINKS+=("$l")
+  for l in "$WTDIR"/*/; do
+    l=${l%/}
+    [[ ${l##*/} == waybarclaude ]] && continue
+    [[ -f "$l/style.css" ]] && grep -q "$MARKER" -- "$l/style.css" 2>/dev/null &&
+      [[ -L "$l/layout.xml" ]] && WSHIMS+=("$l")
   done
-  ((${#WLINKS[@]})) && info "remove  ${#WLINKS[@]} theme symlink(s) we created"
+  ((${#WSHIMS[@]})) && info "remove  ${#WSHIMS[@]} theme shim(s) we created"
 fi
 ((UNTHEME || UNWCONF)) || info "no walker theme installed"
 
@@ -292,7 +296,7 @@ fi
 if ((UNTHEME)); then
   # layout.xml is a verbatim copy of walker's own file so it carries no marker;
   # the marked style.css beside it is what authorises removing the pair.
-  rm -f -- "$WTHEME/style.css" "$WTHEME/layout.xml"
+  rm -f -- "$WTHEME/style.css" "$WTHEME/layout.xml" "$WTHEME/rows.css"
   rmdir -- "$WTHEME" 2>/dev/null &&
     info "removed $(short "$WTHEME")" ||
     info "kept    $(short "$WTHEME") (not empty)"
@@ -302,10 +306,12 @@ if ((UNWCONF)); then
   # Put additional_theme_location back where it pointed before, which the
   # symlink target tells us; if we cannot tell, drop the line and let walker
   # fall back to its own default theme.
+  # The shim's symlinked layout.xml points back at the original theme, which is
+  # how we recover where additional_theme_location used to point.
   orig=''
-  for l in "${WLINKS[@]}"; do
-    tgt=$(readlink -f -- "$l" 2>/dev/null) || continue
-    [[ -n $tgt ]] && orig=$(dirname -- "$tgt") && break
+  for l in "${WSHIMS[@]:-}"; do
+    tgt=$(readlink -f -- "$l/layout.xml" 2>/dev/null) || continue
+    [[ -n $tgt ]] && orig=$(dirname -- "$(dirname -- "$tgt")") && break
   done
   cp -p -- "$WCONF" "$WCONF.bak.$(date +%s)"
   if [[ -n $orig ]]; then
@@ -331,8 +337,9 @@ PYEOF
   fi
 fi
 
-for l in "${WLINKS[@]:-}"; do
-  [[ -L $l ]] && rm -f -- "$l" && info "removed symlink $(short "$l")"
+for l in "${WSHIMS[@]:-}"; do
+  rm -f -- "$l/style.css" "$l/layout.xml"
+  rmdir -- "$l" 2>/dev/null && info "removed shim $(short "$l")"
 done
 [[ -d $WTDIR ]] && rmdir -- "$WTDIR" 2>/dev/null && info "removed $(short "$WTDIR")"
 
