@@ -2,8 +2,8 @@
 # waybarclaude walker theme -- optional add-on.
 #
 # Styles the waybarclaude picker only: opaque panel, compact monospace rows, a
-# hairline under the prompt, and the rows waiting on you tinted amber while the
-# working ones dim back. Your normal launcher keeps the theme it already uses,
+# hairline under the prompt, with the rows still working dimmed back so the ones
+# waiting on you stand out. Your normal launcher keeps the theme it already uses,
 # because the picker asks for this one per-invocation with `walker --theme`.
 #
 # Separate from the main installer on purpose: this is the one part that has to
