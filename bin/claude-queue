@@ -14,30 +14,42 @@
 #
 # HOW IT FINDS A SESSION'S WINDOW
 # Terminals like Ghostty run every window in one process, so a session's window
-# cannot be derived from the process tree. Two mechanisms cover it:
+# cannot be derived from the process tree. Three mechanisms cover it:
 #   1. Claude records the terminal title it set for a session as "aiTitle" in the
 #      session transcript. The live window title is that same string behind a
 #      status marker, so matching the two identifies the window exactly. This
 #      works for sessions that already existed before the daemon started.
 #   2. If a session has no title yet, the window focused at the moment a turn
 #      starts is its window, because you just pressed enter in it.
+#   3. A session inside a tmux pane has no window of its own, and neither of the
+#      above can find one. It is located through tmux instead: see the tmux
+#      section below.
 # A session lives in one window for its whole life, so the first binding wins.
 #
+# WHY A ROW ALWAYS LEADS SOMEWHERE
+# Two things used to leave rows in the queue that did nothing when clicked: a
+# session killed outright leaves its roster file behind, and a session in a tmux
+# pane has no window to focus. Liveness is therefore decided by /proc rather than
+# by the roster file, and panes are resolved through tmux, both without polling.
+#
 # Subcommands:
-#   status            waybar JSON: in-flight count + waiting count
-#   menu              picker; selecting focuses the window and dequeues it
-#   watch             the event daemon (blocks; run under systemd)
-#   enqueue <sid>     add a session to the queue
-#   drop <sid>        remove by session id      (exit 1 if it was not queued)
-#   drop-addr <addr>  remove by window address  (exit 1 if it was not queued)
-#   bind <sid> <addr> record which window a session lives in (first bind wins)
-#   resolve <sid>     find a session's window by matching its transcript title
-#   unbind <sid>      forget a session's window so it can be re-learned
-#   list              print the queue and the bindings, for debugging
-#   clear             empty the queue
-#   sync              prune dead sessions and closed windows, rewrite caches
-#   signal            nudge waybar
-#   doctor            check dependencies and report what is wired up
+#   status             waybar JSON: in-flight count + waiting count
+#   menu               picker; selecting jumps to the session and dequeues it
+#   watch              the event daemon (blocks; run under systemd)
+#   enqueue <sid> [a]  add a session to the queue; skipped if you are looking at
+#                      it right now, which is what the optional address means
+#   drop <sid>         remove by session id      (exit 1 if it was not queued)
+#   drop-window <addr> remove everything in a window that has gone away
+#   drop-visited <a>   remove what you just looked at in that window: the window
+#                      itself, or only the visible pane if it is running tmux
+#   bind <sid> <addr>  record which window a session lives in (first bind wins)
+#   resolve <sid>      find a session's window by matching its transcript title
+#   unbind <sid>       forget a session's window so it can be re-learned
+#   list               print the queue and the bindings, for debugging
+#   clear              empty the queue
+#   sync               prune dead sessions and closed windows, rewrite caches
+#   signal             nudge waybar
+#   doctor             check dependencies and report what is wired up
 
 set -uo pipefail
 
@@ -124,11 +136,13 @@ event_socket() {
     "${XDG_RUNTIME_DIR:-/run/user/$UID}" "$HYPRLAND_INSTANCE_SIGNATURE"
 }
 
-# address SEP class SEP title, one line per window
+# address SEP class SEP pid SEP title, one line per window. Title stays last
+# because it is the only field that can contain anything.
 enumerate_windows() {
   hypr_ready || return 1
   hyprctl clients -j 2>/dev/null |
-    jq -r --arg s "$SEP" '.[] | .address + $s + .class + $s + .title' 2>/dev/null
+    jq -r --arg s "$SEP" \
+      '.[] | .address + $s + .class + $s + (.pid|tostring) + $s + .title' 2>/dev/null
 }
 
 focused_window() {
@@ -141,20 +155,70 @@ focus_window() {
   hyprctl dispatch focuswindow "address:$1" >/dev/null 2>&1
 }
 
+# --- processes ---------------------------------------------------------------
+# Everything here reads /proc with builtins only. No forks, so it is safe on the
+# daemon's hot paths.
+
+# comm and ppid of a pid. The comm field is parenthesised and can itself contain
+# spaces ("tmux: server"), so it is split off at the last ')' rather than counted
+# out by field number.
+PS_COMM='' PS_PPID=''
+proc_stat() {
+  local s rest
+  IFS= read -r s <"/proc/$1/stat" 2>/dev/null || return 1
+  rest=${s#*(}
+  PS_COMM=${rest%)*}
+  rest=${rest##*)}
+  [[ $rest =~ ^[[:space:]]+[^[:space:]]+[[:space:]]+([0-9]+) ]] || return 1
+  PS_PPID=${BASH_REMATCH[1]}
+}
+
+# Claude deletes a session's roster file when it exits, but a session that is
+# killed outright never gets the chance, so the file outlives the process and the
+# queue keeps offering a row that cannot lead anywhere. /proc is the authority.
+pid_live() {
+  local p=$1 c=''
+  [[ $p =~ ^[0-9]+$ ]] || return 1
+  [[ -d /proc/$p ]] || return 1
+  # Without this a recycled pid would keep a dead record alive forever. comm is
+  # "claude" for the released binary and the runtime's name when run from source;
+  # if it cannot be read we have no opinion and leave the session alone.
+  IFS= read -r c <"/proc/$p/comm" 2>/dev/null || return 0
+  [[ -z $c || $c == *claude* || $c == node || $c == bun || $c == deno ]]
+}
+
+# A pid and its ancestors, as a set, plus whether a tmux server is among them --
+# which is how a session in a pane gives itself away before any tmux command is
+# run. The depth cap is a guard against a cycle in a lying /proc.
+declare -A ANC=()
+ANC_TMUX=0
+ancestry() {
+  local p=${1:-} n=0
+  ANC=()
+  ANC_TMUX=0
+  while [[ $p =~ ^[0-9]+$ ]] && ((p > 1)) && ((n++ < 16)); do
+    ANC[$p]=1
+    proc_stat "$p" || break
+    [[ $PS_COMM == tmux:* ]] && ANC_TMUX=1
+    p=$PS_PPID
+  done
+}
+
 # --- roster ------------------------------------------------------------------
 # A session is in flight while its status is busy or thinking. Anything else
 # (idle, waiting, blocked) means the turn is over and it wants your attention.
-declare -A R_STATUS R_NAME R_CWD
+declare -A R_STATUS R_NAME R_CWD R_PID
 ROSTER_IDS=()
 
 in_flight() { [[ $1 == busy || $1 == thinking ]]; }
 
 scan_roster() {
-  local f j sid
+  local f j sid pid
   ROSTER_IDS=()
   R_STATUS=()
   R_NAME=()
   R_CWD=()
+  R_PID=()
   for f in "$SESSIONS_DIR"/*.json; do
     [[ -e $f ]] || continue
     j=''
@@ -162,6 +226,12 @@ scan_roster() {
     [[ -n $j ]] || continue
     [[ $j =~ \"sessionId\":\"([^\"]+)\" ]] || continue
     sid=${BASH_REMATCH[1]}
+    # A leftover file is not a session. Skipping it here is what keeps the bar
+    # count, the tooltip and the picker honest without anything having to poll.
+    pid=''
+    [[ $j =~ \"pid\":([0-9]+) ]] && pid=${BASH_REMATCH[1]}
+    [[ -n $pid ]] && ! pid_live "$pid" && continue
+    R_PID[$sid]=$pid
     R_STATUS[$sid]=idle
     [[ $j =~ \"status\":\"([^\"]+)\" ]] && R_STATUS[$sid]=${BASH_REMATCH[1]}
     R_NAME[$sid]=$sid
@@ -178,23 +248,38 @@ session_alive() {
     [[ -e $f ]] || continue
     j=''
     IFS= read -r -d '' j <"$f" 2>/dev/null || :
-    [[ $j == *"\"sessionId\":\"$sid\""* ]] && return 0
+    [[ $j == *"\"sessionId\":\"$sid\""* ]] || continue
+    [[ $j =~ \"pid\":([0-9]+) ]] || return 0
+    pid_live "${BASH_REMATCH[1]}" && return 0
+    return 1
   done
   return 1
 }
 
 # --- windows -----------------------------------------------------------------
-declare -A W_TITLE W_TERM
+declare -A W_TITLE W_TERM PID_WIN PID_SEEN
 have_windows=0
 
 load_windows() {
-  local a c t
+  local a c p t
   ((have_windows)) && return 0
   have_windows=1
-  while IFS=$SEP read -r a c t; do
+  while IFS=$SEP read -r a c p t; do
     [[ -n $a ]] || continue
     W_TITLE[$a]=$t
     [[ -n ${TERM_CLASS_SET[$c]:-} ]] && W_TERM[$a]=1
+    # A process that owns more than one window cannot identify either of them --
+    # that is the single-process terminal case -- so it is recorded as ambiguous
+    # and never used. A terminal spawned to run one command keeps a process of its
+    # own, and that is the case this map exists for.
+    if [[ $p =~ ^[0-9]+$ ]] && ((p > 1)); then
+      if [[ -n ${PID_SEEN[$p]:-} ]]; then
+        PID_WIN[$p]=''
+      else
+        PID_SEEN[$p]=1
+        PID_WIN[$p]=$a
+      fi
+    fi
   done < <(enumerate_windows)
 }
 
@@ -202,6 +287,8 @@ reset_windows() {
   have_windows=0
   W_TITLE=()
   W_TERM=()
+  PID_WIN=()
+  PID_SEEN=()
 }
 
 is_terminal() {
@@ -237,6 +324,93 @@ window_for_title() {
   done
   ((n == 1)) || return 1
   printf '%s' "$hit"
+}
+
+# --- tmux --------------------------------------------------------------------
+# A session running in a tmux pane has no window of its own. Its process tree
+# hangs off the detached tmux server, so the compositor knows nothing about it,
+# and its terminal is titled after tmux rather than the session, so the transcript
+# title finds nothing either. Left at that, such a session sits in the queue as a
+# row that goes nowhere when clicked. Two hops close the gap: the session's pid
+# identifies its pane, and the pane's tmux session identifies the attached client,
+# whose process tree does lead to a real window -- a client is one process per
+# terminal window even when the terminal itself is not.
+#
+# None of it runs unless a session's ancestry already contains a tmux server, so a
+# machine without tmux never forks tmux at all, and the two commands below are
+# read-only: they never write to a pane.
+declare -A T_PANE_OF=() T_PANE_SESS=() T_PANE_TITLE=() T_PANE_VIS=() T_CLIENTS=()
+T_LOADED=0 # 0 not tried, 1 loaded, 2 unavailable
+
+tmux_load() {
+  ((T_LOADED)) && return $((T_LOADED - 1))
+  T_LOADED=2
+  command -v tmux >/dev/null 2>&1 || return 1
+  local id pid sess vis title cs cpid
+  while IFS=$SEP read -r id pid sess vis title; do
+    [[ -n $id ]] || continue
+    T_PANE_OF[$pid]=$id
+    T_PANE_SESS[$id]=$sess
+    T_PANE_TITLE[$id]=$title
+    # On screen means the pane is current in its window and that window is current
+    # in its session; anything else is behind something.
+    [[ $vis == 11 ]] && T_PANE_VIS[$id]=1
+  done < <(tmux list-panes -a -F \
+    "#{pane_id}$SEP#{pane_pid}$SEP#{session_name}$SEP#{?pane_active,1,}#{?window_active,1,}$SEP#{pane_title}" \
+    2>/dev/null)
+  ((${#T_PANE_OF[@]})) || return 1
+  while IFS=$SEP read -r cs cpid; do
+    [[ -n $cs && -n $cpid ]] || continue
+    T_CLIENTS[$cs]="${T_CLIENTS[$cs]:-}$cpid "
+  done < <(tmux list-clients -F "#{client_session}$SEP#{client_pid}" 2>/dev/null)
+  T_LOADED=1
+}
+
+# Locate a session's pane and the window showing it. TP_HOST is empty when the
+# tmux session is not attached anywhere, which is a real state: the pane exists
+# and can be selected, but no window is displaying it.
+TP_PANE='' TP_HOST=''
+tmux_locate() {
+  local p cpid n
+  TP_PANE='' TP_HOST=''
+  ancestry "${1:-}"
+  ((ANC_TMUX)) || return 1
+  tmux_load || return 1
+  # Walking the ancestry rather than matching the pid outright covers a session
+  # started from a shell inside the pane, where the pane's process is that shell.
+  for p in "${!ANC[@]}"; do
+    [[ -n ${T_PANE_OF[$p]:-} ]] && {
+      TP_PANE=${T_PANE_OF[$p]}
+      break
+    }
+  done
+  [[ -n $TP_PANE ]] || return 1
+  load_windows
+  for cpid in ${T_CLIENTS[${T_PANE_SESS[$TP_PANE]}]:-}; do
+    p=$cpid
+    n=0
+    while [[ $p =~ ^[0-9]+$ ]] && ((p > 1)) && ((n++ < 16)); do
+      [[ -n ${PID_WIN[$p]:-} ]] && {
+        TP_HOST=${PID_WIN[$p]}
+        return 0
+      }
+      proc_stat "$p" || break
+      p=$PS_PPID
+    done
+  done
+  return 0
+}
+
+# Bring a pane into view: select it inside tmux, then focus the window drawing it.
+# Selecting changes what tmux paints and nothing else -- no keys are sent, so the
+# session is not disturbed.
+tmux_focus() {
+  local pane=$1 host=${2:-} ok=1
+  command -v tmux >/dev/null 2>&1 || return 1
+  tmux select-window -t "$pane" 2>/dev/null && ok=0
+  tmux select-pane -t "$pane" 2>/dev/null && ok=0
+  [[ -n $host ]] && focus_window "$host"
+  return $ok
 }
 
 # --- bindings ----------------------------------------------------------------
@@ -305,6 +479,13 @@ resolve_all() {
 cmd_bind() {
   local sid=$1 addr=$2 cur owner
   [[ -n $addr && $addr != 0x0 ]] || return 1
+  # A pane shares its window with every other pane in the same terminal, so
+  # binding one session to it would make that session speak for all of them and
+  # focusing it would land on whichever pane happened to be on screen. Panes go
+  # through tmux instead. The check is a /proc walk, so it costs no fork.
+  scan_roster
+  ancestry "${R_PID[$sid]:-}"
+  ((ANC_TMUX)) && return 1
   cur=$(binding_for "$sid") || cur=''
   [[ $cur == "$addr" ]] && return 0
   if [[ -n $cur ]]; then
@@ -328,12 +509,22 @@ cmd_unbind() {
 }
 
 # --- queue -------------------------------------------------------------------
-# queue.tsv record: sid SEP addr SEP name SEP cwd SEP epoch SEP title
+# queue.tsv record:
+#   sid SEP addr SEP name SEP cwd SEP epoch SEP title SEP pane SEP host
+# addr is the session's own window. A session in a tmux pane has none, and carries
+# pane plus host -- the window showing that pane -- instead. The two trailing
+# fields were added later, so a record written by an older version simply reads
+# back with both empty.
 write_addrs() {
-  local addrs='' sid addr rest
-  while IFS=$SEP read -r sid addr rest; do
-    [[ -n $addr ]] && addrs+="$addr "
+  local addrs=' ' sid addr name cwd ts title pane host
+  while IFS=$SEP read -r sid addr name cwd ts title pane host; do
+    # A pane's terminal stands in for it here, so focusing that terminal still
+    # reaches the daemon's hot path and the visit can be noticed. Several panes
+    # share one terminal, hence the deduplication.
+    [[ -n $addr ]] || addr=$host
+    [[ -n $addr && $addrs != *" $addr "* ]] && addrs+="$addr "
   done <"$QUEUE"
+  addrs=${addrs# }
   printf '%s\n' "${addrs% }" >"$ADDRS"
 }
 
@@ -346,8 +537,9 @@ sanitize() {
   printf '%s' "$v"
 }
 
+# $2, when given, is the window focused at the moment the turn ended.
 cmd_enqueue() {
-  local sid=$1 addr name cwd title='' keep=() s rest
+  local sid=$1 focused=${2:-} addr name cwd title='' pane='' host='' keep=() s rest
   scan_roster
   [[ -n ${R_STATUS[$sid]:-} ]] || return 1
   name=${R_NAME[$sid]}
@@ -357,15 +549,28 @@ cmd_enqueue() {
   if [[ -n $addr ]]; then
     load_windows
     title=${W_TITLE[$addr]:-}
+  elif tmux_locate "${R_PID[$sid]:-}"; then
+    pane=$TP_PANE
+    host=$TP_HOST
+    # tmux keeps the title the session set for its pane, which is the same string
+    # the window title would have carried.
+    title=${T_PANE_TITLE[$pane]:-}
   fi
   [[ -n $title ]] || title=$name
+
+  # You watched it finish, so there is nothing to tell you. For a pane that means
+  # its terminal was focused and the pane was the one on screen.
+  if [[ -n $focused ]]; then
+    [[ -n $addr && $addr == "$focused" ]] && return 1
+    [[ -n $pane && $host == "$focused" && -n ${T_PANE_VIS[$pane]:-} ]] && return 1
+  fi
 
   exec 8>"$LOCK"
   flock 8
   while IFS=$SEP read -r s rest; do
     [[ -n $s && $s != "$sid" ]] && keep+=("$s$SEP$rest")
   done <"$QUEUE"
-  keep+=("$sid$SEP$addr$SEP$(sanitize "$name")$SEP$(sanitize "$cwd")$SEP$EPOCHSECONDS$SEP$(sanitize "$title")")
+  keep+=("$sid$SEP$addr$SEP$(sanitize "$name")$SEP$(sanitize "$cwd")$SEP$EPOCHSECONDS$SEP$(sanitize "$title")$SEP$pane$SEP$host")
   printf '%s\n' "${keep[@]}" >"$QUEUE.tmp" && mv -f "$QUEUE.tmp" "$QUEUE"
   flock -u 8
   exec 8>&-
@@ -374,20 +579,37 @@ cmd_enqueue() {
   signal_waybar
 }
 
-# Remove queue records whose field $1 (1=sid, 2=addr) equals $2. Returns 1 when
-# nothing matched, so callers can tell a real change from a no-op.
+# Remove queue records. Mode:
+#   sid     <session id>
+#   win     <address>  the window is gone, so everything inside it goes with it
+#   visited <address>  you just looked at that window: it takes the session bound
+#                      to it, or, if it is running tmux, only the pane on screen
+# Returns 1 when nothing matched, so callers can tell a real change from a no-op.
 queue_remove() {
-  local field=$1 value=$2 removed=0 keep=() sid addr name cwd ts title cmp
+  local mode=$1 value=$2 removed=0 keep=() sid addr name cwd ts title pane host hit
   exec 8>"$LOCK"
   flock 8
-  while IFS=$SEP read -r sid addr name cwd ts title; do
+  while IFS=$SEP read -r sid addr name cwd ts title pane host; do
     [[ -n $sid ]] || continue
-    if ((field == 1)); then cmp=$sid; else cmp=$addr; fi
-    if [[ $cmp == "$value" ]]; then
+    hit=0
+    case $mode in
+    sid) [[ $sid == "$value" ]] && hit=1 ;;
+    win) { [[ -n $addr && $addr == "$value" ]] ||
+      [[ -n $host && $host == "$value" ]]; } && hit=1 ;;
+    visited)
+      if [[ -n $addr && $addr == "$value" ]]; then
+        hit=1
+      elif [[ -n $pane && $host == "$value" ]] &&
+        tmux_load && [[ -n ${T_PANE_VIS[$pane]:-} ]]; then
+        hit=1
+      fi
+      ;;
+    esac
+    if ((hit)); then
       removed=1
       continue
     fi
-    keep+=("$sid$SEP$addr$SEP$name$SEP$cwd$SEP$ts$SEP$title")
+    keep+=("$sid$SEP$addr$SEP$name$SEP$cwd$SEP$ts$SEP$title$SEP$pane$SEP$host")
   done <"$QUEUE"
   if ((removed)); then
     if ((${#keep[@]})); then
@@ -406,8 +628,9 @@ queue_remove() {
   return 0
 }
 
-cmd_drop() { queue_remove 1 "$1"; }
-cmd_drop_addr() { queue_remove 2 "$1"; }
+cmd_drop() { queue_remove sid "$1"; }
+cmd_drop_window() { queue_remove win "$1"; }
+cmd_drop_visited() { queue_remove visited "$1"; }
 
 cmd_clear() {
   [[ -s $QUEUE ]] || return 1
@@ -417,15 +640,19 @@ cmd_clear() {
 }
 
 cmd_sync() {
-  local sid addr name cwd ts title s a old='' new='' i
+  local sid addr name cwd ts title pane host s a old='' new='' i
   local -a keep=() b_keep=()
   scan_roster
   load_windows
 
-  # Bindings: forget sessions that ended and windows that closed.
+  # Bindings: forget sessions that ended and windows that closed. A session in a
+  # pane is dropped too -- an older version could bind one to the terminal running
+  # tmux, which then answered for every pane in it.
   while IFS=$SEP read -r s a; do
     [[ -n $s ]] || continue
     [[ -z ${R_STATUS[$s]:-} || -z ${W_TITLE[$a]:-} ]] && continue
+    ancestry "${R_PID[$s]:-}"
+    ((ANC_TMUX)) && continue
     b_keep+=("$s$SEP$a")
   done <"$BINDINGS"
   if ((${#b_keep[@]})); then
@@ -438,14 +665,23 @@ cmd_sync() {
   # Then learn whatever the transcripts can tell us about the rest.
   resolve_all
 
-  # Queue: drop sessions that ended or went back to work, refresh the rest.
-  while IFS=$SEP read -r sid addr name cwd ts title; do
+  # Queue: drop sessions that ended or went back to work, and re-locate the rest.
+  # Re-locating is what keeps a row clickable: a window can be reassigned, and a
+  # pane can move between tmux windows or lose the client that was showing it.
+  while IFS=$SEP read -r sid addr name cwd ts title pane host; do
     [[ -n $sid ]] || continue
     [[ -z ${R_STATUS[$sid]:-} ]] && continue
     in_flight "${R_STATUS[$sid]}" && continue
     addr=$(binding_for "$sid") || addr=''
-    [[ -n $addr && -n ${W_TITLE[$addr]:-} ]] && title=${W_TITLE[$addr]}
-    keep+=("$sid$SEP$addr$SEP$name$SEP$cwd$SEP$ts$SEP$title")
+    pane='' host=''
+    if [[ -n $addr && -n ${W_TITLE[$addr]:-} ]]; then
+      title=${W_TITLE[$addr]}
+    elif tmux_locate "${R_PID[$sid]:-}"; then
+      pane=$TP_PANE
+      host=$TP_HOST
+      [[ -n ${T_PANE_TITLE[$pane]:-} ]] && title=$(sanitize "${T_PANE_TITLE[$pane]}")
+    fi
+    keep+=("$sid$SEP$addr$SEP$name$SEP$cwd$SEP$ts$SEP$title$SEP$pane$SEP$host")
   done <"$QUEUE"
 
   for ((i = 0; i < ${#keep[@]}; i++)); do new+="${keep[i]}"$'\n'; done
@@ -487,15 +723,18 @@ strip_marker() {
 }
 
 cmd_status() {
-  local sid addr t name cwd ts title running=0 waiting=0 text='' class='' tip='' l
+  local sid addr t name cwd ts title pane host running=0 waiting=0 text='' class='' tip='' l
   local -a flight=() wait_lines=()
 
   scan_roster
-  while IFS=$SEP read -r sid addr name cwd ts title; do
+  while IFS=$SEP read -r sid addr name cwd ts title pane host; do
     [[ -n $sid ]] || continue
-    # A session that is running again is not waiting on you, even if sync has
-    # not pruned the record yet.
-    [[ -n ${R_STATUS[$sid]:-} ]] && in_flight "${R_STATUS[$sid]}" && continue
+    # Judge every record against the roster rather than trusting the file, so a
+    # session that has ended, or gone back to work, stops being counted here even
+    # though sync has not pruned it yet. Without this the bar can show a number
+    # the picker will not back up.
+    [[ -n ${R_STATUS[$sid]:-} ]] || continue
+    in_flight "${R_STATUS[$sid]}" && continue
     ((waiting++))
     t=''
     if [[ -n $addr ]]; then
@@ -629,19 +868,21 @@ run_menu() {
 cmd_menu() {
   local -a lines=()
   local -A PICK=()
-  local sid addr name cwd ts title label t kind entry sel waiting=0
+  local sid addr name cwd ts title pane host label t kind entry sel waiting=0
 
+  # sync first: it prunes what has ended and re-locates the rest, so every row
+  # offered below was checked a moment ago rather than when it was queued.
   cmd_sync
   load_windows
 
-  while IFS=$SEP read -r sid addr name cwd ts title; do
+  while IFS=$SEP read -r sid addr name cwd ts title pane host; do
     [[ -n $sid ]] || continue
     t=''
     [[ -n $addr ]] && t=${W_TITLE[$addr]:-}
     [[ -n $t ]] || t=$title
     label="$ICON_WAITING  $(strip_marker "$t")   ·  $(tilde "$cwd")"
     while [[ -n ${PICK[$label]:-} ]]; do label+=' '; done
-    PICK[$label]="q$SEP$sid$SEP$addr"
+    PICK[$label]="q$SEP$sid$SEP$addr$SEP$pane$SEP$host"
     lines+=("$label")
     ((waiting++))
   done <"$QUEUE"
@@ -650,12 +891,19 @@ cmd_menu() {
     [[ -n $sid ]] || continue
     in_flight "${R_STATUS[$sid]}" || continue
     addr=$(binding_for "$sid") || addr=''
+    pane='' host=''
     t=''
-    [[ -n $addr ]] && t=${W_TITLE[$addr]:-}
+    if [[ -n $addr ]]; then
+      t=${W_TITLE[$addr]:-}
+    elif tmux_locate "${R_PID[$sid]:-}"; then
+      pane=$TP_PANE
+      host=$TP_HOST
+      t=${T_PANE_TITLE[$pane]:-}
+    fi
     [[ -n $t ]] || t=${R_NAME[$sid]}
     label="$ICON_RUNNING  $(strip_marker "$t")   ·  $(tilde "${R_CWD[$sid]}")"
     while [[ -n ${PICK[$label]:-} ]]; do label+=' '; done
-    PICK[$label]="r$SEP$sid$SEP$addr"
+    PICK[$label]="r$SEP$sid$SEP$addr$SEP$pane$SEP$host"
     lines+=("$label")
   done
 
@@ -670,9 +918,24 @@ cmd_menu() {
 
   entry=${PICK[$sel]:-}
   [[ -n $entry ]] || return 0
-  IFS=$SEP read -r kind sid addr <<<"$entry"
+  IFS=$SEP read -r kind sid addr pane host <<<"$entry"
 
-  [[ -n $addr ]] && focus_window "$addr"
+  if [[ -n $pane ]]; then
+    tmux_focus "$pane" "$host" || :
+    # The pane is selected either way, so the row has done its job and goes. Say
+    # so when there was no window to raise, rather than looking like nothing
+    # happened.
+    [[ -n $host ]] || notify-send -u low "Claude queue" \
+      "Selected its tmux pane. No window is showing that tmux session." 2>/dev/null || :
+  elif [[ -n $addr ]]; then
+    focus_window "$addr"
+  else
+    # Nothing to jump to. Keep the entry: it is still telling you something true,
+    # and dropping it here is what made rows feel broken.
+    notify-send -u low "Claude queue" \
+      "Could not find a window for this session, so it stays in the queue." 2>/dev/null || :
+    return 0
+  fi
   [[ $kind == q ]] && cmd_drop "$sid"
   return 0
 }
@@ -750,16 +1013,10 @@ session_event() {
     # It is working again, so it is no longer waiting on you.
     "$SELF" drop "$sid" >/dev/null 2>&1 || "$SELF" signal
   elif in_flight "$prev"; then
-    # A turn ended. If you were looking at it, you already know.
-    addr=$(binding_for "$sid") || addr=''
-    # Not bound yet (a session older than this daemon): the transcript title can
-    # still identify the window, so this check works the first time too.
-    [[ -n $addr ]] || addr=$("$SELF" resolve "$sid" 2>/dev/null)
-    if [[ -n $addr && $addr == "$CUR_FOCUS" ]]; then
-      "$SELF" signal
-    else
-      "$SELF" enqueue "$sid" >/dev/null 2>&1 || "$SELF" signal
-    fi
+    # A turn ended. Locating the session and deciding whether you were already
+    # looking at it both happen inside enqueue, which has to locate it anyway --
+    # one fork instead of two, and one place where the answer lives.
+    "$SELF" enqueue "$sid" "$CUR_FOCUS" >/dev/null 2>&1 || "$SELF" signal
   else
     "$SELF" signal
   fi
@@ -829,14 +1086,17 @@ cmd_watch() {
       a=${line#*'>>'}
       if [[ $a =~ ^[0-9a-fA-F]+$ ]]; then CUR_FOCUS="0x$a"; else CUR_FOCUS=''; fi
       dbg "focus -> $CUR_FOCUS"
-      # Visiting a session yourself clears its entry.
+      # Visiting a session yourself clears its entry. For a terminal running tmux
+      # only the pane you can actually see counts as visited.
       [[ -n $CUR_FOCUS ]] && queued_addr "$CUR_FOCUS" &&
-        "$SELF" drop-addr "$CUR_FOCUS" >/dev/null 2>&1
+        "$SELF" drop-visited "$CUR_FOCUS" >/dev/null 2>&1
       ;;
     'closewindow>>'*)
       a=${line#*'>>'}
       [[ $a =~ ^[0-9a-fA-F]+$ ]] || continue
-      queued_addr "0x$a" && "$SELF" drop-addr "0x$a" >/dev/null 2>&1
+      # The window is gone, so every session that lived in it goes as well --
+      # including every pane, if it was running tmux.
+      queued_addr "0x$a" && "$SELF" drop-window "0x$a" >/dev/null 2>&1
       ;;
     '!resync')
       daemon_resync
@@ -853,11 +1113,18 @@ cmd_watch() {
 
 # --- diagnostics -------------------------------------------------------------
 cmd_list() {
-  local sid addr name cwd ts title s a
+  local sid addr name cwd ts title pane host where s a
   printf 'queue:\n'
-  while IFS=$SEP read -r sid addr name cwd ts title; do
+  while IFS=$SEP read -r sid addr name cwd ts title pane host; do
     [[ -n $sid ]] || continue
-    printf '  %-14s %-16s %s\n' "$name" "${addr:-unbound}" "$title"
+    if [[ -n $addr ]]; then
+      where=$addr
+    elif [[ -n $pane ]]; then
+      where="pane $pane in ${host:-<no window>}"
+    else
+      where='<nowhere>'
+    fi
+    printf '  %-14s %-28s %s\n' "$name" "$where" "$title"
   done <"$QUEUE"
   printf 'bindings:\n'
   while IFS=$SEP read -r s a; do
@@ -898,11 +1165,41 @@ cmd_doctor() {
 
   printf 'claude code\n'
   if [[ -d $SESSIONS_DIR ]]; then
-    printf '  ok      roster %s (%s live)\n' "$SESSIONS_DIR" \
-      "$(set -- "$SESSIONS_DIR"/*.json; [[ -e $1 ]] && echo $# || echo 0)"
+    local files=0 dead=0
+    for p in "$SESSIONS_DIR"/*.json; do
+      [[ -e $p ]] || continue
+      ((files++))
+    done
+    scan_roster
+    dead=$((files - ${#ROSTER_IDS[@]}))
+    printf '  ok      roster %s (%s live' "$SESSIONS_DIR" "${#ROSTER_IDS[@]}"
+    ((dead > 0)) && printf ', %s leftover file(s) whose process is gone' "$dead"
+    printf ')\n'
   else
     printf '  MISSING %s does not exist\n' "$SESSIONS_DIR"
     ((miss++))
+  fi
+
+  printf 'tmux\n'
+  if ! command -v tmux >/dev/null 2>&1; then
+    printf '  n/a     not installed; nothing to locate\n'
+  else
+    local inpane=0 located=0 sid
+    for sid in "${ROSTER_IDS[@]:-}"; do
+      [[ -n $sid ]] || continue
+      tmux_locate "${R_PID[$sid]:-}" || continue
+      ((inpane++))
+      [[ -n $TP_HOST ]] && ((located++))
+    done
+    if ((inpane == 0)); then
+      printf '  ok      no session is running in a pane\n'
+    elif ((located == inpane)); then
+      printf '  ok      %s session(s) in panes, all reachable\n' "$inpane"
+    else
+      printf '  ok      %s session(s) in panes, %s reachable\n' "$inpane" "$located"
+      printf '  note    the rest are in a tmux session no window is showing;\n'
+      printf '          attach it and they become clickable\n'
+    fi
   fi
 
   printf 'daemon\n'
@@ -945,9 +1242,10 @@ case ${1:-status} in
 status) cmd_status ;;
 menu) cmd_menu ;;
 watch) cmd_watch ;;
-enqueue) cmd_enqueue "${2:?session id}" ;;
+enqueue) cmd_enqueue "${2:?session id}" "${3:-}" ;;
 drop) cmd_drop "${2:?session id}" ;;
-drop-addr) cmd_drop_addr "${2:?window address}" ;;
+drop-window) cmd_drop_window "${2:?window address}" ;;
+drop-visited) cmd_drop_visited "${2:?window address}" ;;
 bind) cmd_bind "${2:?session id}" "${3:?window address}" ;;
 resolve) resolve_one "${2:?session id}" ;;
 unbind) cmd_unbind "${2:?session id}" ;;
@@ -957,7 +1255,7 @@ sync) cmd_sync ;;
 signal) signal_waybar ;;
 doctor) cmd_doctor ;;
 -h | --help | help)
-  sed -n '3,40p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '3,52p' "$SELF" | sed 's/^# \{0,1\}//'
   ;;
 *)
   printf 'claude-queue: unknown command %q\n' "$1" >&2

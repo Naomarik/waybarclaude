@@ -38,8 +38,13 @@ Everything you'd expect, so the queue never lies to you:
 - you pick it from the menu
 - **you visit that window any other way** — the notification, a keybind, alt-tab, the mouse
 - the session starts working again
-- the session exits, or its window closes
+- the session exits, or its window closes — or is killed outright, leaving its
+  roster file behind
 - a turn that finishes while you're *already looking at that window* never queues at all
+
+For a session in a tmux pane the same rules apply per **pane**: only the pane you
+can actually see counts as visited, and a turn that ends in the pane you are
+watching never queues.
 
 ## Install
 
@@ -123,6 +128,8 @@ for what it changes, why that one line is needed, and how to tune the colours.
 - a dmenu-capable launcher — `walker`, `fuzzel`, `rofi`, `wofi`, `tofi`,
   `bemenu` or `dmenu`, auto-detected in that order
 - a Nerd Font in your bar, for the default icons
+- `tmux` **only if you run sessions in panes** — it is what makes those rows
+  clickable, and it is never invoked otherwise
 
 ```sh
 # Arch
@@ -146,7 +153,7 @@ observation**, so it cannot disturb a session you have running.
 
 Terminals like Ghostty run every window in **one process**. All eleven of your
 windows report the same PID, so there is no way to get from a session to its
-window through the process tree. Two mechanisms cover it:
+window through the process tree. Three mechanisms cover it:
 
 **1. Transcript title match (primary).** Claude records the terminal title it set
 for a session as `aiTitle` in the session transcript. The live window title is
@@ -160,6 +167,33 @@ enter in it.
 
 A session lives in one window for its whole life, so the first binding wins, and a
 window already claimed by another live session is never stolen.
+
+**3. tmux panes.** A session in a pane has no window of its own: its process tree
+hangs off the detached tmux server, and its terminal is titled after tmux rather
+than the session, so neither mechanism above finds anything. Two hops close the
+gap — the session's PID identifies its pane, and the pane's tmux session
+identifies the attached client, whose process tree *does* lead to a real window.
+Clicking such a row selects the pane and raises that window.
+
+This matters as soon as you run several sessions in one terminal: without it, a
+whole tmux window's worth of sessions queue up as rows that go nowhere. tmux is
+optional, and none of this runs unless a session's ancestry actually contains a
+tmux server — a machine without tmux never invokes it.
+
+### Nothing in the queue is stale
+
+Every row is checked against reality rather than against the record that created
+it:
+
+- **Liveness comes from `/proc`, not from the roster file.** Claude removes a
+  session's file when it exits, but a session that is *killed* never gets the
+  chance, so the file outlives the process. The bar stops counting such a session
+  the moment it next refreshes, and `sync` prunes the record.
+- **The picker re-locates every row before it draws it.** A window can be
+  reassigned; a pane can move, or lose the client that was showing it.
+- **A row that genuinely has nowhere to go says so.** It stays in the queue and
+  tells you it could not find a window, instead of silently vanishing as though
+  the click had worked.
 
 ## Configuration
 
@@ -185,8 +219,8 @@ Find your terminal's class with
 claude-queue status     waybar JSON (what the module runs)
 claude-queue menu       the picker
 claude-queue watch      the event daemon (systemd runs this)
-claude-queue list       the queue and the window bindings
-claude-queue doctor     check dependencies and wiring
+claude-queue list       the queue and the window bindings, panes included
+claude-queue doctor     check dependencies, wiring, and what is reachable
 claude-queue clear      empty the queue
 claude-queue unbind ID  forget a session's window so it can be re-learned
 claude-queue sync       prune dead sessions and closed windows
@@ -202,25 +236,34 @@ Measured across the whole process tree over 60s of normal desktop use:
 
 | | |
 |---|---|
-| CPU | **1 jiffie — 0.017% of one core** |
-| RSS | 18.6 MiB combined, mostly shared bash text |
+| CPU | **0 jiffies — unmeasurable** |
+| RSS | 19.5 MiB combined, mostly shared bash text |
+
+That was taken with 14 sessions live, 9 of them in tmux panes.
 
 Hyprland re-emits focus events constantly, so the daemon *does* wake often, but
 each wake is shell string operations against a one-line cache file. A subprocess
-is forked only when the queue actually changes. The bar module is signal-driven
+is forked only when the queue actually changes. Deciding whether a session is
+alive, and whether it lives in a tmux pane, is `/proc` read with shell builtins —
+no fork either, which is why tmux support costs nothing until a pane session
+actually finishes a turn. The bar module is signal-driven
 (`interval: once` + `signal`), so it runs when something happens rather than on a
 timer.
 
 ## Limitations
 
-- **One session per window.** Two sessions in tabs or splits of the same window
-  collapse to one address: focusing the window works, picking the right tab
-  doesn't.
+- **One session per window, unless it's tmux.** Sessions in tmux panes are
+  resolved individually. Sessions in a terminal's own tabs or splits are not —
+  those collapse to one address, so focusing the window works and picking the
+  right tab doesn't.
+- A pane in a tmux session that **no window is attached to** can be selected but
+  not raised, because there is nothing on screen to raise. The picker tells you
+  so; attach the tmux session and the row starts working.
 - **Hyprland only** for now.
-- A session that has never produced a title *and* was never focused at a turn
-  start will queue without a known window. It still shows and still counts;
-  selecting it just clears it. `claude-queue list` shows which bindings are
-  missing.
+- A session that has never produced a title, was never focused at a turn start,
+  and isn't in a pane will queue without a known window. It still shows and still
+  counts, and picking it says it could not find a window rather than pretending it
+  worked. `claude-queue list` shows which rows are in that state.
 - The roster is Claude Code's internal state, not a documented API. It's been
   stable in practice, but a future version could change it — `claude-queue
   doctor` will tell you if it stops parsing.
@@ -252,11 +295,12 @@ waybar config was byte-identical to the original.
 ./test/e2e.sh
 ```
 
-27 assertions covering every transition, the picker, and idle CPU. It runs the
-real daemon against a scratch roster and a **fake compositor event socket**, so
-focus events are deterministic and nothing touches your real `~/.claude` or your
-real queue. Needs Hyprland running with at least three windows of the same class
-open.
+45 assertions covering every transition, tmux panes, leftover roster files, the
+picker, and idle CPU. It runs the real daemon against a scratch roster and a
+**fake compositor event socket**, so focus events are deterministic and nothing
+touches your real `~/.claude` or your real queue. `hyprctl` and `notify-send` are
+shimmed, so the suite can never steal your focus or pop a toast at you. Needs
+Hyprland running with at least three windows of the same class open.
 
 ## License
 
